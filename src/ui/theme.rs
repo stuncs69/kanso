@@ -29,6 +29,8 @@ pub struct Theme {
     pub popup_background: Color,
     pub popup_foreground: Color,
     pub popup_selected: Color,
+    pub search_match: Color,
+    pub search_current: Color,
 }
 
 impl Default for Theme {
@@ -53,6 +55,8 @@ impl Default for Theme {
             popup_background: Color::Rgb(0x25, 0x2b, 0x38),
             popup_foreground: Color::Rgb(0xc8, 0xcc, 0xd4),
             popup_selected: Color::Rgb(0x3e, 0x46, 0x5a),
+            search_match: Color::Rgb(0x45, 0x51, 0x5f),
+            search_current: Color::Rgb(0x7d, 0x62, 0x2f),
         }
     }
 }
@@ -123,6 +127,8 @@ impl Theme {
             "popup.background" => &mut self.popup_background,
             "popup.foreground" => &mut self.popup_foreground,
             "popup.selected" => &mut self.popup_selected,
+            "search.match" => &mut self.search_match,
+            "search.current" => &mut self.search_current,
             _ => return false,
         };
         *slot = color;

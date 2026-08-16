@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use super::command::Command;
 use super::completion::{self, Completion};
 use super::explorer::Explorer;
+use super::finder::Finder;
+use super::search::{self, Field, Match, Search};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
@@ -56,10 +58,13 @@ pub struct Editor {
     pub hover: Option<HoverInfo>,
     pub menu: Option<Menu>,
     pub explorer: Option<Explorer>,
+    pub finder: Option<Finder>,
+    pub search: Option<Search>,
     pub lsp_indicator: Option<String>,
     background: Vec<Buffer>,
     highlighter: Highlighter,
     clipboard: String,
+    search_memo: Option<(String, bool)>,
     lsp_completion_wanted: Option<usize>,
     lsp_hover_wanted: Option<Position>,
     menu_wanted: bool,
@@ -81,10 +86,13 @@ impl Editor {
             hover: None,
             menu: None,
             explorer: None,
+            finder: None,
+            search: None,
             lsp_indicator: None,
             background: Vec::new(),
             highlighter,
             clipboard: String::new(),
+            search_memo: None,
             lsp_completion_wanted: None,
             lsp_hover_wanted: None,
             menu_wanted: false,
@@ -185,6 +193,7 @@ impl Editor {
         self.buffer.take_dirty_from();
         self.completion = None;
         self.hover = None;
+        self.search = None;
         self.quit_confirmed = false;
         self.viewport.top_line = 0;
         self.viewport.left_col = 0;
@@ -266,6 +275,8 @@ impl Editor {
         self.hover = None;
         self.menu = None;
         self.explorer = None;
+        self.finder = None;
+        self.close_search();
         self.buffer.set_cursor_pos(pos, extend);
         self.sync_viewport();
     }
@@ -285,6 +296,7 @@ impl Editor {
         self.completion = None;
         self.hover = None;
         self.menu = None;
+        self.finder = None;
         self.update_highlights();
     }
 
@@ -316,6 +328,14 @@ impl Editor {
         }
         if self.explorer.is_some() {
             self.explorer_command(command);
+            return;
+        }
+        if self.finder.is_some() {
+            self.finder_command(command);
+            return;
+        }
+        if self.search.is_some() {
+            self.search_command(command);
             return;
         }
         self.hover = None;
@@ -356,6 +376,12 @@ impl Editor {
             Command::LspMenu => self.menu_wanted = true,
             Command::Help => self.help_wanted = true,
             Command::Explorer => self.open_explorer(),
+            Command::FindFile => self.open_finder(),
+            Command::Find => self.open_search(false),
+            Command::Replace | Command::ReplaceAll => self.open_search(true),
+            Command::FindNext => self.repeat_search(1),
+            Command::FindPrevious => self.repeat_search(-1),
+            Command::ToggleSearchCase => self.toggle_remembered_case(),
             Command::NextBuffer => self.next_buffer(),
             Command::PrevBuffer => self.prev_buffer(),
             Command::CloseBuffer => self.close_buffer(),
@@ -835,6 +861,367 @@ impl Editor {
         } else {
             self.explorer = None;
             self.open_file(&target);
+        }
+    }
+
+    fn open_search(&mut self, replacing: bool) {
+        if let Some(search) = self.search.as_mut() {
+            search.replacing |= replacing;
+            search.field = if replacing {
+                Field::Replacement
+            } else {
+                Field::Query
+            };
+            return;
+        }
+        let seed = self
+            .buffer
+            .selected_text()
+            .filter(|text| !text.is_empty() && !text.contains('\n'))
+            .or_else(|| self.search_memo.as_ref().map(|(query, _)| query.clone()))
+            .unwrap_or_default();
+        let case_sensitive = self.search_memo.as_ref().is_some_and(|(_, case)| *case);
+        let origin = self
+            .buffer
+            .selection()
+            .map(|sel| sel.start)
+            .unwrap_or(self.buffer.cursor.pos);
+        self.completion = None;
+        self.hover = None;
+        let mut search = Search::new(&seed, case_sensitive, replacing, origin);
+        search.refresh(&self.buffer);
+        if replacing && !seed.is_empty() {
+            search.field = Field::Replacement;
+        }
+        self.search = Some(search);
+        self.select_current_match();
+    }
+
+    fn close_search(&mut self) {
+        if let Some(search) = self.search.take() {
+            let query = search.query.value();
+            if !query.is_empty() {
+                self.search_memo = Some((query, search.case_sensitive));
+            }
+        }
+    }
+
+    fn select_current_match(&mut self) {
+        let Some(hit) = self.search.as_ref().and_then(Search::current_match) else {
+            return;
+        };
+        self.select_match(hit);
+    }
+
+    fn select_match(&mut self, hit: Match) {
+        self.buffer.set_cursor_pos(hit.start_position(), false);
+        self.buffer.set_cursor_pos(hit.end_position(), true);
+        self.sync_viewport();
+    }
+
+    fn search_command(&mut self, command: Command) {
+        let mut requery = false;
+        let mut step = 0isize;
+        let mut close = false;
+        let mut paste = false;
+        let mut replace_current = false;
+        let mut replace_all = false;
+        let mut forward = None;
+        {
+            let Some(search) = self.search.as_mut() else {
+                return;
+            };
+            let editing_query = search.field == Field::Query;
+            match command {
+                Command::InsertChar(c) => {
+                    search.active_prompt().insert(c);
+                    requery = editing_query;
+                }
+                Command::Backspace => {
+                    search.active_prompt().backspace();
+                    requery = editing_query;
+                }
+                Command::Delete => {
+                    search.active_prompt().delete();
+                    requery = editing_query;
+                }
+                Command::Paste => paste = true,
+                Command::SelectAll => {
+                    search.active_prompt().clear();
+                    requery = editing_query;
+                }
+                Command::Move(Motion::Up) | Command::Select(Motion::Up) => step = -1,
+                Command::Move(Motion::Down) | Command::Select(Motion::Down) => step = 1,
+                Command::Move(motion) | Command::Select(motion) => {
+                    search.active_prompt().move_cursor(motion);
+                }
+                Command::InsertNewline => {
+                    if editing_query {
+                        step = 1;
+                    } else {
+                        replace_current = true;
+                    }
+                }
+                Command::InsertTab | Command::Outdent => {
+                    search.replacing = true;
+                    search.field = if editing_query {
+                        Field::Replacement
+                    } else {
+                        Field::Query
+                    };
+                }
+                Command::Find => search.field = Field::Query,
+                Command::Replace => {
+                    search.replacing = true;
+                    search.field = Field::Replacement;
+                }
+                Command::FindNext => step = 1,
+                Command::FindPrevious => step = -1,
+                Command::ReplaceAll => replace_all = true,
+                Command::ToggleSearchCase => {
+                    search.case_sensitive = !search.case_sensitive;
+                    requery = true;
+                }
+                Command::Cancel | Command::Quit | Command::CloseBuffer => close = true,
+                Command::Save
+                | Command::Help
+                | Command::LspMenu
+                | Command::Explorer
+                | Command::FindFile => {
+                    close = true;
+                    forward = Some(command);
+                }
+                _ => {}
+            }
+        }
+
+        if paste {
+            let text = self.clipboard.clone();
+            if let Some(search) = self.search.as_mut() {
+                let editing_query = search.field == Field::Query;
+                search.active_prompt().insert_text(&text);
+                requery = editing_query;
+            }
+        }
+        if requery {
+            if let Some(search) = self.search.as_mut() {
+                search.refresh(&self.buffer);
+            }
+            self.select_current_match();
+        }
+        if step != 0 {
+            if let Some(search) = self.search.as_mut() {
+                search.step(step);
+            }
+            self.select_current_match();
+            self.report_search_position();
+        }
+        if replace_current {
+            self.replace_current_match();
+        }
+        if replace_all {
+            self.replace_every_match();
+        }
+        if close {
+            self.close_search();
+        }
+        if let Some(command) = forward {
+            self.execute(command);
+        }
+    }
+
+    fn report_search_position(&mut self) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        if search.matches.is_empty() && !search.query.is_empty() {
+            let query = search.query.value();
+            self.set_info(format!("No results for {query}"));
+        }
+    }
+
+    fn replace_current_match(&mut self) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        let Some(hit) = search.current_match() else {
+            self.set_info("No results");
+            return;
+        };
+        let replacement = search.replacement.value();
+        self.buffer
+            .replace_ranges(&[(hit.start_position(), hit.end_position())], &replacement);
+        let resume = self.buffer.cursor.pos;
+        if let Some(search) = self.search.as_mut() {
+            search.origin = resume;
+            search.refresh(&self.buffer);
+        }
+        self.select_current_match();
+        self.sync_viewport();
+    }
+
+    fn replace_every_match(&mut self) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        if search.matches.is_empty() {
+            self.set_info("No results");
+            return;
+        }
+        let ranges = search.ranges();
+        let replacement = search.replacement.value();
+        let count = self.buffer.replace_ranges(&ranges, &replacement);
+        let resume = self.buffer.cursor.pos;
+        if let Some(search) = self.search.as_mut() {
+            search.origin = resume;
+            search.refresh(&self.buffer);
+        }
+        self.sync_viewport();
+        let plural = if count == 1 {
+            "occurrence"
+        } else {
+            "occurrences"
+        };
+        self.set_info(format!("Replaced {count} {plural}"));
+    }
+
+    fn repeat_search(&mut self, delta: isize) {
+        let Some((query, case_sensitive)) = self.search_memo.clone() else {
+            self.open_search(false);
+            return;
+        };
+        let matches = search::find_matches(&self.buffer, &query, case_sensitive);
+        if matches.is_empty() {
+            self.set_info(format!("No results for {query}"));
+            return;
+        }
+        let selection = self.buffer.selection();
+        let index = if delta >= 0 {
+            let from = selection
+                .map(|sel| sel.end)
+                .unwrap_or(self.buffer.cursor.pos);
+            matches
+                .iter()
+                .position(|hit| hit.start_position() >= from)
+                .unwrap_or(0)
+        } else {
+            let from = selection
+                .map(|sel| sel.start)
+                .unwrap_or(self.buffer.cursor.pos);
+            matches
+                .iter()
+                .rposition(|hit| hit.start_position() < from)
+                .unwrap_or(matches.len() - 1)
+        };
+        self.select_match(matches[index]);
+        self.set_info(format!("{} of {}", index + 1, matches.len()));
+    }
+
+    fn toggle_remembered_case(&mut self) {
+        let Some((_, case_sensitive)) = self.search_memo.as_mut() else {
+            self.set_info("No search to configure");
+            return;
+        };
+        *case_sensitive = !*case_sensitive;
+        let state = if *case_sensitive {
+            "case sensitive"
+        } else {
+            "case insensitive"
+        };
+        self.set_info(format!("Search is {state}"));
+    }
+
+    pub fn finder_visible_rows(&self) -> usize {
+        self.viewport.text_height().saturating_sub(4).clamp(1, 14)
+    }
+
+    fn open_finder(&mut self) {
+        let start = self
+            .buffer
+            .path()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        match Finder::open(&start) {
+            Ok(finder) => {
+                self.completion = None;
+                self.hover = None;
+                self.menu = None;
+                self.explorer = None;
+                self.close_search();
+                self.finder = Some(finder);
+            }
+            Err(e) => self.set_error(format!("finder: {e}")),
+        }
+    }
+
+    fn finder_command(&mut self, command: Command) {
+        let rows = self.finder_visible_rows() as isize;
+        let mut open_selected = false;
+        let mut paste = false;
+        let mut close = false;
+        {
+            let Some(finder) = self.finder.as_mut() else {
+                return;
+            };
+            match command {
+                Command::InsertChar(c) => {
+                    finder.query.insert(c);
+                    finder.refresh();
+                }
+                Command::Backspace => {
+                    if finder.query.backspace() {
+                        finder.refresh();
+                    }
+                }
+                Command::Delete => {
+                    if finder.query.delete() {
+                        finder.refresh();
+                    }
+                }
+                Command::Paste => paste = true,
+                Command::SelectAll => {
+                    finder.query.clear();
+                    finder.refresh();
+                }
+                Command::Move(Motion::Up) | Command::Select(Motion::Up) => {
+                    finder.move_selection(-1)
+                }
+                Command::Move(Motion::Down) | Command::Select(Motion::Down) => {
+                    finder.move_selection(1)
+                }
+                Command::Move(Motion::PageUp) => finder.move_selection(-rows),
+                Command::Move(Motion::PageDown) => finder.move_selection(rows),
+                Command::Move(motion) | Command::Select(motion) => {
+                    finder.query.move_cursor(motion);
+                }
+                Command::InsertNewline => open_selected = true,
+                Command::Cancel | Command::Quit | Command::CloseBuffer | Command::FindFile => {
+                    close = true
+                }
+                _ => {}
+            }
+        }
+        if paste {
+            let text = self.clipboard.clone();
+            if let Some(finder) = self.finder.as_mut() {
+                finder.query.insert_text(&text);
+                finder.refresh();
+            }
+        }
+        if open_selected {
+            let target = self.finder.as_ref().and_then(Finder::selected_path);
+            match target {
+                Some(path) => {
+                    self.finder = None;
+                    self.open_file(&path);
+                }
+                None => self.set_info("No matching files"),
+            }
+        }
+        if close {
+            self.finder = None;
         }
     }
 
@@ -1548,6 +1935,153 @@ mod tests {
             ed.buffer.text(),
             "fn a() {\n    if x {\n        y();\n    }\n}\n"
         );
+    }
+
+    #[test]
+    fn find_highlights_matches_and_enter_walks_them() {
+        let mut ed = editor_with("foo\nbar foo\nfoo");
+        ed.execute(Command::Find);
+        type_text(&mut ed, "foo");
+        let search = ed.search.as_ref().unwrap();
+        assert_eq!(search.matches.len(), 3);
+        assert_eq!(search.counter(), "1/3");
+        assert_eq!(ed.buffer.selected_text().as_deref(), Some("foo"));
+        assert_eq!(ed.buffer.cursor.pos, Position::new(0, 3));
+
+        ed.execute(Command::InsertNewline);
+        assert_eq!(ed.buffer.cursor.pos, Position::new(1, 7));
+        assert_eq!(ed.search.as_ref().unwrap().counter(), "2/3");
+        ed.execute(Command::InsertNewline);
+        ed.execute(Command::InsertNewline);
+        assert_eq!(ed.search.as_ref().unwrap().counter(), "1/3");
+        assert_eq!(ed.buffer.text(), "foo\nbar foo\nfoo");
+    }
+
+    #[test]
+    fn find_seeds_from_a_single_line_selection() {
+        let mut ed = editor_with("alpha beta\nalpha");
+        ed.execute(Command::Select(Motion::WordRight));
+        ed.execute(Command::Find);
+        let search = ed.search.as_ref().unwrap();
+        assert_eq!(search.query.value(), "alpha");
+        assert_eq!(search.matches.len(), 2);
+    }
+
+    #[test]
+    fn escape_closes_search_and_find_next_repeats_it() {
+        let mut ed = editor_with("foo\nbar foo\nfoo");
+        ed.execute(Command::Find);
+        type_text(&mut ed, "foo");
+        ed.execute(Command::Cancel);
+        assert!(ed.search.is_none());
+
+        ed.execute(Command::FindNext);
+        assert_eq!(ed.buffer.cursor.pos, Position::new(1, 7));
+        ed.execute(Command::FindNext);
+        assert_eq!(ed.buffer.cursor.pos, Position::new(2, 3));
+        ed.execute(Command::FindNext);
+        assert_eq!(ed.buffer.cursor.pos, Position::new(0, 3));
+        ed.execute(Command::FindPrevious);
+        assert_eq!(ed.buffer.cursor.pos, Position::new(2, 3));
+    }
+
+    #[test]
+    fn typing_in_the_search_field_never_edits_the_buffer() {
+        let mut ed = editor_with("hello");
+        ed.execute(Command::Find);
+        type_text(&mut ed, "zzz");
+        ed.execute(Command::Backspace);
+        ed.execute(Command::InsertTab);
+        assert_eq!(ed.buffer.text(), "hello");
+        assert_eq!(ed.search.as_ref().unwrap().query.value(), "zz");
+    }
+
+    #[test]
+    fn toggling_case_sensitivity_narrows_matches() {
+        let mut ed = editor_with("Foo foo");
+        ed.execute(Command::Find);
+        type_text(&mut ed, "foo");
+        assert_eq!(ed.search.as_ref().unwrap().matches.len(), 2);
+        ed.execute(Command::ToggleSearchCase);
+        let search = ed.search.as_ref().unwrap();
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(search.matches[0].start, 4);
+    }
+
+    #[test]
+    fn replace_rewrites_the_current_match_and_advances() {
+        let mut ed = editor_with("foo foo");
+        ed.execute(Command::Find);
+        type_text(&mut ed, "foo");
+        ed.execute(Command::Replace);
+        type_text(&mut ed, "x");
+        ed.execute(Command::InsertNewline);
+        assert_eq!(ed.buffer.text(), "x foo");
+        assert_eq!(ed.search.as_ref().unwrap().counter(), "1/1");
+        ed.execute(Command::InsertNewline);
+        assert_eq!(ed.buffer.text(), "x x");
+        ed.execute(Command::Cancel);
+        ed.execute(Command::Undo);
+        assert_eq!(ed.buffer.text(), "x foo");
+    }
+
+    #[test]
+    fn replace_all_rewrites_every_match_in_one_undo_step() {
+        let mut ed = editor_with("foo bar foo\nfoo");
+        ed.execute(Command::Replace);
+        assert_eq!(ed.search.as_ref().unwrap().field, Field::Query);
+        type_text(&mut ed, "foo");
+        ed.execute(Command::InsertTab);
+        assert_eq!(ed.search.as_ref().unwrap().field, Field::Replacement);
+        type_text(&mut ed, "baz");
+        ed.execute(Command::ReplaceAll);
+        assert_eq!(ed.buffer.text(), "baz bar baz\nbaz");
+        ed.execute(Command::Cancel);
+        ed.execute(Command::Undo);
+        assert_eq!(ed.buffer.text(), "foo bar foo\nfoo");
+    }
+
+    fn temp_project(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kanso-project-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "notes\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn finder_opens_a_file_by_fuzzy_query() {
+        let dir = temp_project("open");
+        let start = dir.join("notes.txt");
+        let mut ed = Editor::new(Buffer::from_path(&start).unwrap(), Settings::default());
+        ed.execute(Command::FindFile);
+        assert_eq!(ed.finder.as_ref().unwrap().files.len(), 2);
+        type_text(&mut ed, "mn");
+        let finder = ed.finder.as_ref().unwrap();
+        assert_eq!(finder.hits.len(), 1);
+        assert_eq!(finder.hit_path(&finder.hits[0]), "src/main.rs");
+        ed.execute(Command::InsertNewline);
+        assert!(ed.finder.is_none());
+        assert_eq!(ed.buffer.file_name(), "main.rs");
+        assert_eq!(ed.buffer_count(), 2);
+    }
+
+    #[test]
+    fn finder_typing_leaves_the_buffer_untouched_and_escape_closes() {
+        let dir = temp_project("escape");
+        let start = dir.join("notes.txt");
+        let mut ed = Editor::new(Buffer::from_path(&start).unwrap(), Settings::default());
+        ed.execute(Command::FindFile);
+        type_text(&mut ed, "zzz");
+        assert!(ed.finder.as_ref().unwrap().hits.is_empty());
+        ed.execute(Command::InsertNewline);
+        assert!(ed.finder.is_some());
+        assert_eq!(ed.buffer.text(), "notes\n");
+        ed.execute(Command::Cancel);
+        assert!(ed.finder.is_none());
+        assert_eq!(ed.buffer_count(), 1);
     }
 
     #[test]

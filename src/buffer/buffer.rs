@@ -601,6 +601,56 @@ impl Buffer {
         );
     }
 
+    pub fn replace_ranges(&mut self, ranges: &[(Position, Position)], text: &str) -> usize {
+        self.history.commit();
+        let mut spans: Vec<(usize, usize)> = ranges
+            .iter()
+            .map(|(start, end)| (self.char_idx(*start), self.char_idx(*end)))
+            .filter(|(start, end)| end > start)
+            .collect();
+        spans.sort_unstable();
+        spans.dedup();
+        let Some((first_start, _)) = spans.first().copied() else {
+            return 0;
+        };
+        let (last_start, _) = spans.last().copied().expect("checked above");
+
+        let inserted = text.chars().count();
+        let shift: isize = spans[..spans.len() - 1]
+            .iter()
+            .map(|(start, end)| inserted as isize - (end - start) as isize)
+            .sum();
+        let cursor_idx = (last_start as isize + shift + inserted as isize).max(0) as usize;
+
+        let before = self.cursor.pos;
+        self.anchor = None;
+        let mut ops = Vec::with_capacity(spans.len() * 2);
+        for (start, end) in spans.iter().rev() {
+            let removed = self.rope.slice(*start..*end).to_string();
+            self.rope.remove(*start..*end);
+            ops.push(EditOp::Delete {
+                at: *start,
+                text: removed,
+            });
+            if !text.is_empty() {
+                self.rope.insert(*start, text);
+                ops.push(EditOp::Insert {
+                    at: *start,
+                    text: text.to_string(),
+                });
+            }
+        }
+        self.touch(self.pos_of(first_start).line);
+        let after = self.pos_of(cursor_idx.min(self.rope.len_chars()));
+        self.set_cursor(after, true);
+        for (i, op) in ops.into_iter().enumerate() {
+            let merge = if i == 0 { Merge::Start } else { Merge::Always };
+            self.history.record(op, merge, before, after);
+        }
+        self.history.commit();
+        spans.len()
+    }
+
     pub fn backspace(&mut self) {
         if self.delete_selection_with(Merge::Start) {
             return;
@@ -1292,6 +1342,51 @@ mod tests {
         assert_eq!(buf.leading_whitespace(0), "  \t");
         assert_eq!(buf.indent_width_of(0), 3);
         assert_eq!(buf.leading_whitespace(1), "");
+    }
+
+    #[test]
+    fn replace_ranges_rewrites_every_span_in_one_undo_step() {
+        let mut buf = buffer_with("foo bar\nfoo baz\nfoo");
+        let ranges = [
+            (Position::new(0, 0), Position::new(0, 3)),
+            (Position::new(1, 0), Position::new(1, 3)),
+            (Position::new(2, 0), Position::new(2, 3)),
+        ];
+        assert_eq!(buf.replace_ranges(&ranges, "quux"), 3);
+        assert_eq!(buf.text(), "quux bar\nquux baz\nquux");
+        assert_eq!(buf.cursor.pos, Position::new(2, 4));
+        assert!(buf.undo());
+        assert_eq!(buf.text(), "foo bar\nfoo baz\nfoo");
+        assert!(buf.redo());
+        assert_eq!(buf.text(), "quux bar\nquux baz\nquux");
+    }
+
+    #[test]
+    fn replace_ranges_handles_deletion_and_empty_input() {
+        let mut buf = buffer_with("aXbXc");
+        let ranges = [
+            (Position::new(0, 1), Position::new(0, 2)),
+            (Position::new(0, 3), Position::new(0, 4)),
+        ];
+        assert_eq!(buf.replace_ranges(&ranges, ""), 2);
+        assert_eq!(buf.text(), "abc");
+        assert_eq!(buf.cursor.pos, Position::new(0, 2));
+        assert!(buf.undo());
+        assert_eq!(buf.text(), "aXbXc");
+        assert_eq!(buf.replace_ranges(&[], "y"), 0);
+        assert_eq!(buf.text(), "aXbXc");
+    }
+
+    #[test]
+    fn replace_ranges_is_not_merged_with_neighbouring_edits() {
+        let mut buf = buffer_with("foo");
+        type_str(&mut buf, "z");
+        buf.replace_ranges(&[(Position::new(0, 1), Position::new(0, 4))], "bar");
+        assert_eq!(buf.text(), "zbar");
+        assert!(buf.undo());
+        assert_eq!(buf.text(), "zfoo");
+        assert!(buf.undo());
+        assert_eq!(buf.text(), "foo");
     }
 
     #[test]

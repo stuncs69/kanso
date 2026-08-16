@@ -8,6 +8,8 @@ Code. Without any configuration you get:
 - Syntax highlighting
 - LSP completions and hover docs
 - Autocomplete as you type
+- Find and replace, with every match highlighted
+- Fuzzy file finder over the whole project
 - File explorer and multiple buffers
 - Indentation detected per file, with auto-indent and block indent
 - Auto-closing brackets and quotes, surround-selection
@@ -22,6 +24,14 @@ kanso file.rs            # or several: kanso a.rs b.ts
 
 Missing files are created on first save. `Ctrl+W` closes the buffer, and
 closing the last one quits. Unsaved changes always warn first.
+
+`Ctrl+P` opens the fuzzy file finder. Type any letters that appear in the
+path, in order, and the closest matches rise to the top; `Up`/`Down`
+choose, `Enter` opens, `Esc` closes. It searches the enclosing git
+repository, or the current file's directory when there is no repository,
+skipping hidden files, the usual build directories (`target`,
+`node_modules`, `dist`, `build`, `vendor`, `venv`, `__pycache__`), and
+plain file and `*.ext` entries from the project's top-level `.gitignore`.
 
 `Ctrl+E` opens the file explorer in the current file's directory. Use
 `Up`/`Down` or type a letter to select, `Enter` to open a file or enter a
@@ -38,6 +48,11 @@ rebound. Arrows and page keys scroll the list, `Esc` closes it.
 | `F1` | help, lists all keybindings |
 | `Ctrl+S` / `Ctrl+W` | save / close buffer |
 | `Ctrl+E` or `Ctrl+O` | file explorer |
+| `Ctrl+P` | fuzzy file finder |
+| `Ctrl+F` / `Ctrl+H` | find / find and replace |
+| `F3` / `Shift+F3` | next / previous match |
+| `Alt+C` | toggle case sensitivity |
+| `Alt+R` | replace every match |
 | `Ctrl+PgDn` / `Ctrl+PgUp` | next / previous buffer |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | copy / cut / paste (line if no selection) |
@@ -91,7 +106,25 @@ rust = "rust-analyzer"
 Theme roles: `editor.background/foreground/selection`,
 `line_number.normal/active`, `statusline.background/foreground`,
 `ui.accent/warning/error`, `syntax.keyword/string/comment/function/type/number`,
-`popup.background/foreground/selected`.
+`popup.background/foreground/selected`, `search.match/current`.
+
+## Search and replace
+
+`Ctrl+F` opens the search bar above the statusline, seeded with the
+selection if there is one. Every match is highlighted as you type and the
+current one is picked out in a warmer colour, with a `3/12` counter on the
+right. `Enter` or `F3` moves to the next match, `Shift+F3` to the previous
+one, and both wrap around. `Esc` closes the bar and leaves the cursor on
+the match, so `F3` afterwards keeps walking the same query without
+reopening the bar.
+
+`Alt+C` toggles case sensitivity, shown as `Aa` in the bar. `Ctrl+H` adds
+a replace row, `Tab` moves between the two fields, `Enter` in the replace
+field rewrites the current match and moves on, and `Alt+R` replaces every
+match at once as a single undo step.
+
+Searches are literal text, never regular expressions, and matches never
+span lines.
 
 ## Indentation
 
