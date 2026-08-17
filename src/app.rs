@@ -16,6 +16,7 @@ use crate::editor::command::{Command, CommandRegistry};
 use crate::editor::{Editor, Menu};
 use crate::input::{KeyLookup, KeyPress, Keymap};
 use crate::lsp::{self, LspClient, Reply};
+use crate::plugins::{Event as PluginEvent, PluginHost};
 use crate::syntax;
 use crate::ui::renderer::Renderer;
 use crate::ui::terminal::Terminal;
@@ -44,6 +45,8 @@ pub struct App {
     hover_request: Option<(&'static str, u64, Position)>,
     mouse_at: Option<(u16, u16, Instant)>,
     hover_sent_at: Option<(u16, u16)>,
+    plugins: Option<PluginHost>,
+    last_change: (u64, u64),
 }
 
 impl App {
@@ -55,6 +58,8 @@ impl App {
         mut startup_warnings: Vec<String>,
     ) -> io::Result<Self> {
         let mut keymap = Keymap::with_defaults();
+        let mut registry = CommandRegistry::with_builtins();
+        let plugins = load_plugins(&mut registry, &mut keymap, &mut startup_warnings);
         for (keys, command) in user_keybindings {
             if let Err(e) = keymap.bind_str(keys, command) {
                 startup_warnings.push(format!("keybindings.toml: {e}"));
@@ -79,10 +84,11 @@ impl App {
             None => editor.set_info("F1 for help"),
         }
 
+        let last_change = (editor.buffer.id(), editor.buffer.revision());
         Ok(App {
             editor,
             keymap,
-            registry: CommandRegistry::with_builtins(),
+            registry,
             renderer: Renderer::new(),
             terminal,
             theme,
@@ -93,6 +99,8 @@ impl App {
             hover_request: None,
             mouse_at: None,
             hover_sent_at: None,
+            plugins,
+            last_change,
         })
     }
 
@@ -101,6 +109,8 @@ impl App {
         spawn_input_thread(tx.clone());
         loop {
             self.process_lsp_work(&tx);
+            self.process_plugin_work();
+            self.editor.expire_status();
             self.renderer
                 .draw(&mut self.terminal, &self.editor, &self.theme)?;
             match rx.recv_timeout(TICK) {
@@ -213,6 +223,32 @@ impl App {
             self.show_help_menu();
         }
         self.poll_mouse_hover();
+    }
+
+    fn process_plugin_work(&mut self) {
+        let Some(host) = self.plugins.take() else {
+            self.editor.take_events();
+            self.editor.take_plugin_calls();
+            return;
+        };
+        let change = (self.editor.buffer.id(), self.editor.buffer.revision());
+        if change != self.last_change {
+            self.last_change = change;
+            if host.watches("buffer_changed") {
+                let event = PluginEvent::BufferChanged {
+                    buffer_id: change.0,
+                    revision: change.1,
+                };
+                host.dispatch(&event, &mut self.editor);
+            }
+        }
+        for event in self.editor.take_events() {
+            host.dispatch(&event, &mut self.editor);
+        }
+        for handle in self.editor.take_plugin_calls() {
+            host.run_command(handle, &mut self.editor);
+        }
+        self.plugins = Some(host);
     }
 
     fn ensure_active_lsp(&mut self, tx: &Sender<AppEvent>) {
@@ -446,6 +482,36 @@ impl App {
             "arrows and page keys scroll, esc closes, rebind in keybindings.toml",
         ));
     }
+}
+
+fn load_plugins(
+    registry: &mut CommandRegistry,
+    keymap: &mut Keymap,
+    warnings: &mut Vec<String>,
+) -> Option<PluginHost> {
+    let dir = crate::config::config_dir()?.join("plugins");
+    let existing: Vec<String> = registry.ids().map(str::to_string).collect();
+    let mut host = match PluginHost::new(existing) {
+        Ok(host) => host,
+        Err(e) => {
+            warnings.push(format!("plugins: {e}"));
+            return None;
+        }
+    };
+    warnings.extend(host.load_dir(&dir));
+    for (handle, name) in host.command_names().iter().enumerate() {
+        registry.register(name, Command::Plugin(handle));
+    }
+    for (keys, command) in host.take_bindings() {
+        if registry.get(&command).is_none() {
+            warnings.push(format!("plugins: keymap.bind: unknown command `{command}`"));
+            continue;
+        }
+        if let Err(e) = keymap.bind_str(&keys, &command) {
+            warnings.push(format!("plugins: keymap.bind: {e}"));
+        }
+    }
+    Some(host)
 }
 
 fn format_lsp_row(name: &str, command: Option<&str>, status: &str) -> String {

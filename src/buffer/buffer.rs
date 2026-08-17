@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ropey::Rope;
 
@@ -14,6 +15,7 @@ use super::selection::Selection;
 const DETECT_LINES: usize = 400;
 
 pub struct Buffer {
+    id: u64,
     rope: Rope,
     path: Option<PathBuf>,
     dirty: bool,
@@ -40,7 +42,9 @@ impl Buffer {
     }
 
     fn from_rope(rope: Rope, path: Option<PathBuf>) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         Buffer {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             rope,
             path,
             dirty: false,
@@ -64,6 +68,10 @@ impl Buffer {
 
     pub fn take_dirty_from(&mut self) -> Option<usize> {
         self.dirty_from.take()
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn revision(&self) -> u64 {

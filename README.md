@@ -150,6 +150,66 @@ TypeScript/JavaScript. For TypeScript the native LSP built into TypeScript
 7 is preferred, so `bun install -g typescript` works without node. Press
 `Alt+L` to see what was detected.
 
+## Plugins
+
+Plugins are Lua 5.4 (bundled, no system Lua needed). Each plugin is a
+directory under `~/.config/kanso/plugins/` with an `init.lua`, executed once
+at startup:
+
+```text
+~/.config/kanso/plugins/
+└── word-count/
+    └── init.lua
+```
+
+A plugin that fails to load, or a callback that errors, is reported on the
+status line; the editor keeps running.
+
+The full API is the `kanso` global:
+
+```lua
+kanso.editor.current_buffer()          -- :id() :name() :path() :text() :is_modified()
+kanso.commands.register(name, fn)      -- error if the name is already taken
+kanso.keymap.bind(keys, command)       -- same key syntax as keybindings.toml
+kanso.events.subscribe(event, fn)      -- buffer_opened, buffer_saved, buffer_changed
+kanso.ui.notify(message)               -- status message until the next one
+kanso.ui.set_status_message(msg, ms)   -- status message that clears itself
+```
+
+Plugin commands are ordinary kanso commands: they get an id, show up in the
+`F1` keybinding list, and can be bound from `keybindings.toml` like any
+built-in. Bindings in `keybindings.toml` win over the ones a plugin asks for.
+
+The complete example lives in [`examples/plugins/word-count`](examples/plugins/word-count/init.lua):
+
+```lua
+local function show_stats()
+    local buffer = kanso.editor.current_buffer()
+    local text = buffer:text()
+
+    local words = 0
+
+    for _ in text:gmatch("%S+") do
+        words = words + 1
+    end
+
+    kanso.ui.notify(
+        string.format("%s — %d words", buffer:name(), words)
+    )
+end
+
+kanso.commands.register("stats.words", show_stats)
+
+kanso.keymap.bind("alt+w", "stats.words")
+
+kanso.events.subscribe("buffer_saved", function(event)
+    kanso.ui.set_status_message("Saved buffer " .. event.buffer_id, 1200)
+end)
+```
+
+`buffer_changed` is coalesced: it fires at most once per event loop tick,
+not once per keystroke.
+
 ## Building
 
 ```bash

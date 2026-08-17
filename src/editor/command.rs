@@ -39,6 +39,7 @@ pub enum Command {
     CloseBuffer,
     Save,
     Quit,
+    Plugin(usize),
 }
 
 pub struct CommandRegistry {
@@ -62,6 +63,10 @@ impl CommandRegistry {
 
     pub fn get(&self, id: &str) -> Option<Command> {
         self.commands.get(id).copied()
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.commands.keys().map(String::as_str)
     }
 }
 

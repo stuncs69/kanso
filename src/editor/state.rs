@@ -4,12 +4,14 @@ use crate::syntax::{Highlighter, Span};
 use crate::ui::viewport::Viewport;
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::command::Command;
 use super::completion::{self, Completion};
 use super::explorer::Explorer;
 use super::finder::Finder;
 use super::search::{self, Field, Match, Search};
+use crate::plugins::Event;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
@@ -21,6 +23,7 @@ pub enum MessageKind {
 pub struct StatusMessage {
     pub text: String,
     pub kind: MessageKind,
+    pub expires_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +72,8 @@ pub struct Editor {
     lsp_hover_wanted: Option<Position>,
     menu_wanted: bool,
     help_wanted: bool,
+    plugin_calls: Vec<usize>,
+    events: Vec<Event>,
     quitting: bool,
     quit_confirmed: bool,
 }
@@ -97,10 +102,13 @@ impl Editor {
             lsp_hover_wanted: None,
             menu_wanted: false,
             help_wanted: false,
+            plugin_calls: Vec::new(),
+            events: Vec::new(),
             quitting: false,
             quit_confirmed: false,
         };
         editor.apply_indent_settings();
+        editor.emit(Event::buffer_opened);
         editor
     }
 
@@ -121,7 +129,21 @@ impl Editor {
     }
 
     pub fn add_background(&mut self, buffer: Buffer) {
+        self.events.push(Event::buffer_opened(&buffer));
         self.background.push(buffer);
+    }
+
+    fn emit(&mut self, event: fn(&Buffer) -> Event) {
+        let event = event(&self.buffer);
+        self.events.push(event);
+    }
+
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
+    pub fn take_plugin_calls(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.plugin_calls)
     }
 
     pub fn buffer_count(&self) -> usize {
@@ -149,6 +171,7 @@ impl Editor {
                 let prev = std::mem::replace(&mut self.buffer, next);
                 self.background.push(prev);
                 self.after_buffer_switch();
+                self.emit(Event::buffer_opened);
             }
             Err(e) => self.set_error(format!("cannot open {}: {e}", path.display())),
         }
@@ -204,6 +227,7 @@ impl Editor {
         self.status = Some(StatusMessage {
             text: text.into(),
             kind: MessageKind::Info,
+            expires_at: None,
         });
     }
 
@@ -211,7 +235,23 @@ impl Editor {
         self.status = Some(StatusMessage {
             text: text.into(),
             kind: MessageKind::Error,
+            expires_at: None,
         });
+    }
+
+    pub fn set_info_for(&mut self, text: impl Into<String>, duration: Duration) {
+        self.set_info(text);
+        if let Some(status) = self.status.as_mut() {
+            status.expires_at = Some(Instant::now() + duration);
+        }
+    }
+
+    pub fn expire_status(&mut self) {
+        if let Some(at) = self.status.as_ref().and_then(|s| s.expires_at) {
+            if Instant::now() >= at {
+                self.status = None;
+            }
+        }
     }
 
     pub fn gutter_width(&self) -> u16 {
@@ -385,6 +425,7 @@ impl Editor {
             Command::NextBuffer => self.next_buffer(),
             Command::PrevBuffer => self.prev_buffer(),
             Command::CloseBuffer => self.close_buffer(),
+            Command::Plugin(handle) => self.plugin_calls.push(handle),
             Command::Save => self.save(),
             Command::Quit => self.request_quit(),
         }
@@ -778,6 +819,7 @@ impl Editor {
             Ok(()) => {
                 let lines = self.buffer.len_lines();
                 self.set_info(format!("Saved {} ({lines} lines)", self.buffer.file_name()));
+                self.emit(Event::buffer_saved);
             }
             Err(e) => self.set_error(format!("Save failed: {e}")),
         }

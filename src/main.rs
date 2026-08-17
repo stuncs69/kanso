@@ -4,6 +4,7 @@ mod config;
 mod editor;
 mod input;
 mod lsp;
+mod plugins;
 mod syntax;
 mod ui;
 mod util;
