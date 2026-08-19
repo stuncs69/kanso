@@ -25,6 +25,8 @@ def read_msg():
     return json.loads(sys.stdin.buffer.read(length))
 
 
+saved = False
+
 while True:
     msg = read_msg()
     if msg is None:
@@ -32,12 +34,68 @@ while True:
     method = msg.get("method", "")
     mid = msg.get("id")
     if method == "initialize":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"capabilities": {}}})
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {"capabilities": {
+                "diagnosticProvider": {
+                    "interFileDependencies": False,
+                    "workspaceDiagnostics": False,
+                },
+            }},
+        })
         send({
             "jsonrpc": "2.0",
             "id": 9999,
             "method": "workspace/configuration",
             "params": {"items": [{}, {}]},
+        })
+    elif method == "textDocument/didOpen":
+        send({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": msg["params"]["textDocument"]["uri"],
+                "diagnostics": [
+                    {
+                        "range": {
+                            "start": {"line": 0, "character": 3},
+                            "end": {"line": 0, "character": 7},
+                        },
+                        "severity": 1,
+                        "source": "mock",
+                        "message": "undeclared identifier 'main'",
+                    },
+                    {
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 2},
+                        },
+                        "severity": 2,
+                        "message": "unused",
+                    },
+                ],
+            },
+        })
+    elif method == "textDocument/didSave":
+        saved = True
+    elif method == "textDocument/diagnostic":
+        send({
+            "jsonrpc": "2.0",
+            "id": mid,
+            "result": {
+                "kind": "full",
+                "items": [
+                    {
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 2},
+                        },
+                        "severity": 1,
+                        "message": "after save" if saved else "pulled",
+                    },
+                ],
+            },
         })
     elif method == "textDocument/completion":
         items = [

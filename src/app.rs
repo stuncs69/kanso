@@ -41,6 +41,9 @@ pub struct App {
     clients: HashMap<&'static str, LspClient>,
     attempted: HashSet<&'static str>,
     synced: HashMap<String, u64>,
+    diagnostics: HashMap<String, Vec<lsp::Diagnostic>>,
+    diagnostics_version: u64,
+    diagnostics_shown: Option<(String, u64)>,
     completion_request: Option<(&'static str, u64, usize, usize)>,
     hover_request: Option<(&'static str, u64, Position)>,
     mouse_at: Option<(u16, u16, Instant)>,
@@ -95,6 +98,9 @@ impl App {
             clients: HashMap::new(),
             attempted: HashSet::new(),
             synced: HashMap::new(),
+            diagnostics: HashMap::new(),
+            diagnostics_version: 0,
+            diagnostics_shown: None,
             completion_request: None,
             hover_request: None,
             mouse_at: None,
@@ -212,6 +218,10 @@ impl App {
 
     fn process_lsp_work(&mut self, tx: &Sender<AppEvent>) {
         self.ensure_active_lsp(tx);
+        if self.editor.take_save_notification() {
+            self.send_did_save();
+        }
+        self.publish_diagnostics();
         self.request_completion();
         if let Some(anchor) = self.editor.take_hover_request() {
             self.send_hover(anchor);
@@ -267,16 +277,24 @@ impl App {
                 .get(lsp_id)
                 .cloned()
                 .or_else(|| lsp::default_server(lsp_id, &path));
-            if let Some(command) = command {
-                let forward = tx.clone();
-                match lsp::spawn(&command, &path, lsp_id, move |msg| {
-                    let _ = forward.send(AppEvent::Lsp(lsp_id, msg));
-                }) {
-                    Ok(client) => {
-                        self.clients.insert(lsp_id, client);
+            match command {
+                Some(command) => {
+                    let forward = tx.clone();
+                    match lsp::spawn(&command, &path, lsp_id, move |msg| {
+                        let _ = forward.send(AppEvent::Lsp(lsp_id, msg));
+                    }) {
+                        Ok(client) => {
+                            self.clients.insert(lsp_id, client);
+                        }
+                        Err(e) => self.editor.set_error(format!("lsp: {command}: {e}")),
                     }
-                    Err(e) => self.editor.set_error(format!("lsp: {command}: {e}")),
                 }
+                None if lsp::has_candidates(lsp_id) => {
+                    self.editor.set_info(format!(
+                        "lsp: no {lsp_id} server installed (alt+l for details)"
+                    ));
+                }
+                None => {}
             }
         }
         let Some(client) = self.clients.get_mut(lsp_id) else {
@@ -293,16 +311,30 @@ impl App {
         }
         let uri = lsp::file_uri(&path);
         let revision = self.editor.buffer.revision();
-        if !client.is_open(&uri) {
+        let synced = if !client.is_open(&uri) {
             let text = self.editor.buffer.text();
-            if client.did_open(&uri, &text).is_ok() {
-                self.synced.insert(uri, revision);
-            }
+            client.did_open(&uri, &text).is_ok()
         } else if self.synced.get(&uri) != Some(&revision) {
             let text = self.editor.buffer.text();
-            if client.did_change(&uri, &text).is_ok() {
-                self.synced.insert(uri, revision);
+            client.did_change(&uri, &text).is_ok()
+        } else {
+            return;
+        };
+        if synced {
+            if client.supports_pull() {
+                let _ = client.pull_diagnostics(&uri);
             }
+            self.synced.insert(uri, revision);
+        }
+    }
+
+    fn send_did_save(&mut self) {
+        let Some((_, uri, client)) = self.active_ready_client() else {
+            return;
+        };
+        let _ = client.did_save(&uri);
+        if client.supports_pull() {
+            let _ = client.pull_diagnostics(&uri);
         }
     }
 
@@ -341,6 +373,14 @@ impl App {
                     }
                 }
             }
+            Ok(Reply::Diagnostics { uri, items }) => {
+                self.diagnostics_version += 1;
+                if items.is_empty() {
+                    self.diagnostics.remove(&uri);
+                } else {
+                    self.diagnostics.insert(uri, items);
+                }
+            }
             Ok(Reply::Failed(message)) => {
                 self.editor.set_error(format!("lsp: {message}"));
                 self.clients.remove(lsp_id);
@@ -350,6 +390,22 @@ impl App {
                 self.clients.remove(lsp_id);
             }
         }
+    }
+
+    fn publish_diagnostics(&mut self) {
+        let uri = match self.active_language() {
+            Some((_, path)) if self.editor.settings.lsp => lsp::file_uri(&path),
+            _ => String::new(),
+        };
+        let stamp = (uri, self.diagnostics_version);
+        if self.diagnostics_shown.as_ref() == Some(&stamp) {
+            return;
+        }
+        match self.diagnostics.get(&stamp.0) {
+            Some(items) => self.editor.set_diagnostics(items),
+            None => self.editor.clear_diagnostics(),
+        }
+        self.diagnostics_shown = Some(stamp);
     }
 
     fn active_ready_client(&mut self) -> Option<(&'static str, String, &mut LspClient)> {

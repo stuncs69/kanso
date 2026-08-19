@@ -1,6 +1,7 @@
 use crate::buffer::{Buffer, IndentStyle, Motion, Position};
-use crate::config::Settings;
+use crate::config::{DiagnosticsDisplay, Settings};
 use crate::syntax::{Highlighter, Span};
+use crate::ui::layout::ScreenRow;
 use crate::ui::viewport::Viewport;
 
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::command::Command;
 use super::completion::{self, Completion};
+use super::diagnostics::{self, Diagnostic};
 use super::explorer::Explorer;
 use super::finder::Finder;
 use super::search::{self, Field, Match, Search};
@@ -63,6 +65,7 @@ pub struct Editor {
     pub explorer: Option<Explorer>,
     pub finder: Option<Finder>,
     pub search: Option<Search>,
+    pub diagnostics: Vec<Diagnostic>,
     pub lsp_indicator: Option<String>,
     background: Vec<Buffer>,
     highlighter: Highlighter,
@@ -72,6 +75,7 @@ pub struct Editor {
     lsp_hover_wanted: Option<Position>,
     menu_wanted: bool,
     help_wanted: bool,
+    saved_wanted: bool,
     plugin_calls: Vec<usize>,
     events: Vec<Event>,
     quitting: bool,
@@ -93,6 +97,7 @@ impl Editor {
             explorer: None,
             finder: None,
             search: None,
+            diagnostics: Vec::new(),
             lsp_indicator: None,
             background: Vec::new(),
             highlighter,
@@ -102,6 +107,7 @@ impl Editor {
             lsp_hover_wanted: None,
             menu_wanted: false,
             help_wanted: false,
+            saved_wanted: false,
             plugin_calls: Vec::new(),
             events: Vec::new(),
             quitting: false,
@@ -271,9 +277,111 @@ impl Editor {
         let display_col = self
             .buffer
             .display_col(self.buffer.cursor.pos, self.settings.tab_width);
-        self.viewport
-            .ensure_visible(self.buffer.cursor.pos.line, display_col, gutter);
+        self.scroll_to_cursor_line();
+        self.viewport.ensure_col_visible(display_col, gutter);
         self.update_highlights();
+    }
+
+    fn scroll_to_cursor_line(&mut self) {
+        let line = self.buffer.cursor.pos.line;
+        if self.virtual_rows_for(line) == 0 && self.diagnostics.is_empty() {
+            self.viewport.ensure_line_visible(line);
+            return;
+        }
+        if line < self.viewport.top_line {
+            self.viewport.top_line = line;
+            return;
+        }
+        let height = self.viewport.text_height().max(1);
+        let mut used = 1 + self.virtual_rows_for(line);
+        if used > height {
+            self.viewport.top_line = self.viewport.top_line.max(line);
+            return;
+        }
+        let mut top = line;
+        while top > 0 {
+            let cost = 1 + self.virtual_rows_for(top - 1);
+            if used + cost > height {
+                break;
+            }
+            used += cost;
+            top -= 1;
+        }
+        if self.viewport.top_line < top {
+            self.viewport.top_line = top;
+        }
+    }
+
+    fn virtual_rows_for(&self, line: usize) -> usize {
+        if self.settings.diagnostics != DiagnosticsDisplay::VirtualRows {
+            return 0;
+        }
+        match diagnostics::on_line(&self.diagnostics, line).count() {
+            0 => 0,
+            messages => messages + 1,
+        }
+    }
+
+    pub fn screen_rows(&self) -> Vec<ScreenRow> {
+        let height = self.viewport.text_height();
+        let mut rows = Vec::with_capacity(height);
+        let mut line = self.viewport.top_line;
+        while rows.len() < height && line < self.buffer.len_lines() {
+            rows.push(ScreenRow::Text(line));
+            let messages = self.virtual_rows_for(line).saturating_sub(1);
+            if messages > 0 && rows.len() < height {
+                rows.push(ScreenRow::Underline(line));
+            }
+            for index in 0..messages {
+                if rows.len() >= height {
+                    break;
+                }
+                rows.push(ScreenRow::Message { line, index });
+            }
+            line += 1;
+        }
+        rows
+    }
+
+    pub fn set_diagnostics(&mut self, raw: &[crate::lsp::Diagnostic]) {
+        let resolved = diagnostics::resolve(&self.buffer, raw);
+        if resolved == self.diagnostics {
+            return;
+        }
+        self.diagnostics = resolved;
+        self.sync_viewport();
+    }
+
+    pub fn clear_diagnostics(&mut self) {
+        if self.diagnostics.is_empty() {
+            return;
+        }
+        self.diagnostics.clear();
+        self.sync_viewport();
+    }
+
+    pub fn diagnostic_counts(&self) -> (usize, usize) {
+        diagnostics::counts(&self.diagnostics)
+    }
+
+    pub fn diagnostic_at_cursor(&self) -> Option<&Diagnostic> {
+        diagnostics::at_position(&self.diagnostics, self.buffer.cursor.pos)
+    }
+
+    fn goto_diagnostic(&mut self, forward: bool) {
+        let from = self.buffer.cursor.pos;
+        let Some(target) = diagnostics::step(&self.diagnostics, from, forward) else {
+            self.set_info("No diagnostics");
+            return;
+        };
+        let position = target.start;
+        let severity = target.severity;
+        let summary = target.summary();
+        self.buffer.set_cursor_pos(position, false);
+        match severity {
+            crate::lsp::Severity::Error => self.set_error(summary),
+            _ => self.set_info(summary),
+        }
     }
 
     fn update_highlights(&mut self) {
@@ -349,7 +457,12 @@ impl Editor {
         if row >= self.viewport.text_height() {
             return None;
         }
-        let line = (self.viewport.top_line + row).min(self.buffer.len_lines().saturating_sub(1));
+        let rows = self.screen_rows();
+        let line = match rows.get(row) {
+            Some(ScreenRow::Text(line)) => *line,
+            Some(other) => return Some(Position::new(other.line(), 0)),
+            None => (self.viewport.top_line + row).min(self.buffer.len_lines().saturating_sub(1)),
+        };
         let gutter = self.gutter_width();
         let target = self.viewport.left_col + x.saturating_sub(gutter) as usize;
         let col = self
@@ -413,6 +526,8 @@ impl Editor {
             Command::MoveLineDown => self.buffer.move_line_down(),
             Command::TriggerCompletion => {}
             Command::Hover => self.lsp_hover_wanted = Some(self.buffer.cursor.pos),
+            Command::NextDiagnostic => self.goto_diagnostic(true),
+            Command::PrevDiagnostic => self.goto_diagnostic(false),
             Command::LspMenu => self.menu_wanted = true,
             Command::Help => self.help_wanted = true,
             Command::Explorer => self.open_explorer(),
@@ -486,7 +601,7 @@ impl Editor {
                     self.set_info("No completions");
                 }
             }
-            Command::Hover => {}
+            Command::Hover | Command::NextDiagnostic | Command::PrevDiagnostic => {}
             _ => {
                 self.completion = None;
                 self.lsp_completion_wanted = None;
@@ -513,6 +628,10 @@ impl Editor {
 
     pub fn take_help_request(&mut self) -> bool {
         std::mem::take(&mut self.help_wanted)
+    }
+
+    pub fn take_save_notification(&mut self) -> bool {
+        std::mem::take(&mut self.saved_wanted)
     }
 
     pub fn menu_visible_rows(&self) -> usize {
@@ -819,6 +938,7 @@ impl Editor {
             Ok(()) => {
                 let lines = self.buffer.len_lines();
                 self.set_info(format!("Saved {} ({lines} lines)", self.buffer.file_name()));
+                self.saved_wanted = true;
                 self.emit(Event::buffer_saved);
             }
             Err(e) => self.set_error(format!("Save failed: {e}")),
@@ -2133,5 +2253,82 @@ mod tests {
         let many = "x\n".repeat(120);
         let ed = editor_with(&many);
         assert_eq!(ed.gutter_width(), 5);
+    }
+
+    fn sized_editor(text: &str) -> Editor {
+        let mut ed = editor_with(text);
+        ed.viewport.resize(60, 12);
+        ed.sync_viewport();
+        ed
+    }
+
+    fn raw_diagnostic(line: usize, severity: crate::lsp::Severity) -> crate::lsp::Diagnostic {
+        crate::lsp::Diagnostic {
+            start_line: line,
+            start_utf16: 1,
+            end_line: line,
+            end_utf16: 3,
+            severity,
+            message: format!("trouble on {line}"),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn f8_walks_diagnostics_and_reports_them() {
+        let mut ed = sized_editor("aaaa\nbbbb\ncccc\n");
+        ed.execute(Command::NextDiagnostic);
+        assert_eq!(ed.status.as_ref().unwrap().text, "No diagnostics");
+
+        ed.set_diagnostics(&[
+            raw_diagnostic(2, crate::lsp::Severity::Warning),
+            raw_diagnostic(0, crate::lsp::Severity::Error),
+        ]);
+        assert_eq!(ed.diagnostic_counts(), (1, 1));
+
+        ed.buffer.set_cursor_pos(Position::new(0, 0), false);
+        ed.execute(Command::NextDiagnostic);
+        assert_eq!(ed.buffer.cursor.pos, Position::new(0, 1));
+        assert_eq!(ed.status.as_ref().unwrap().kind, MessageKind::Error);
+        assert_eq!(ed.status.as_ref().unwrap().text, "trouble on 0");
+
+        ed.execute(Command::NextDiagnostic);
+        assert_eq!(ed.buffer.cursor.pos, Position::new(2, 1));
+        assert_eq!(ed.status.as_ref().unwrap().kind, MessageKind::Info);
+
+        ed.execute(Command::NextDiagnostic);
+        assert_eq!(ed.buffer.cursor.pos, Position::new(0, 1));
+        ed.execute(Command::PrevDiagnostic);
+        assert_eq!(ed.buffer.cursor.pos, Position::new(2, 1));
+    }
+
+    #[test]
+    fn screen_rows_reserve_space_only_in_virtual_row_mode() {
+        let mut ed = sized_editor("aaaa\nbbbb\ncccc\n");
+        ed.set_diagnostics(&[raw_diagnostic(1, crate::lsp::Severity::Error)]);
+        let rows = ed.screen_rows();
+        assert_eq!(rows[0], ScreenRow::Text(0));
+        assert_eq!(rows[1], ScreenRow::Text(1));
+        assert_eq!(rows[2], ScreenRow::Underline(1));
+        assert_eq!(rows[3], ScreenRow::Message { line: 1, index: 0 });
+        assert_eq!(rows[4], ScreenRow::Text(2));
+
+        ed.settings.diagnostics = DiagnosticsDisplay::EndOfLine;
+        let rows = ed.screen_rows();
+        assert_eq!(rows[1], ScreenRow::Text(1));
+        assert_eq!(rows[2], ScreenRow::Text(2));
+    }
+
+    #[test]
+    fn diagnostics_are_cleared_and_deduplicated() {
+        let mut ed = sized_editor("aaaa\n");
+        ed.set_diagnostics(&[raw_diagnostic(0, crate::lsp::Severity::Error)]);
+        let before = ed.viewport.top_line;
+        ed.set_diagnostics(&[raw_diagnostic(0, crate::lsp::Severity::Error)]);
+        assert_eq!(ed.diagnostics.len(), 1);
+        assert_eq!(ed.viewport.top_line, before);
+        ed.clear_diagnostics();
+        assert!(ed.diagnostics.is_empty());
+        assert!(ed.diagnostic_at_cursor().is_none());
     }
 }

@@ -16,14 +16,16 @@ impl Viewport {
         self.height.saturating_sub(1) as usize
     }
 
-    pub fn ensure_visible(&mut self, line: usize, display_col: usize, gutter: u16) {
+    pub fn ensure_line_visible(&mut self, line: usize) {
         let text_height = self.text_height().max(1);
         if line < self.top_line {
             self.top_line = line;
         } else if line >= self.top_line + text_height {
             self.top_line = line + 1 - text_height;
         }
+    }
 
+    pub fn ensure_col_visible(&mut self, display_col: usize, gutter: u16) {
         let text_width = (self.width.saturating_sub(gutter) as usize).max(1);
         if display_col < self.left_col {
             self.left_col = display_col;
@@ -44,9 +46,9 @@ mod tests {
             height: 11,
             ..Viewport::default()
         };
-        vp.ensure_visible(25, 0, 4);
+        vp.ensure_line_visible(25);
         assert_eq!(vp.top_line, 16);
-        vp.ensure_visible(3, 0, 4);
+        vp.ensure_line_visible(3);
         assert_eq!(vp.top_line, 3);
     }
 
@@ -57,9 +59,9 @@ mod tests {
             height: 5,
             ..Viewport::default()
         };
-        vp.ensure_visible(0, 30, 4);
+        vp.ensure_col_visible(30, 4);
         assert_eq!(vp.left_col, 15);
-        vp.ensure_visible(0, 2, 4);
+        vp.ensure_col_visible(2, 4);
         assert_eq!(vp.left_col, 2);
     }
 
@@ -70,7 +72,8 @@ mod tests {
             height: 24,
             ..Viewport::default()
         };
-        vp.ensure_visible(5, 10, 4);
+        vp.ensure_line_visible(5);
+        vp.ensure_col_visible(10, 4);
         assert_eq!(vp.top_line, 0);
         assert_eq!(vp.left_col, 0);
     }

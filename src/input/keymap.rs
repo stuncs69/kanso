@@ -118,6 +118,8 @@ const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("ctrl+space", "editor.trigger_completion"),
     ("alt+h", "editor.hover"),
     ("ctrl+k ctrl+i", "editor.hover"),
+    ("f8", "diagnostic.next"),
+    ("shift+f8", "diagnostic.previous"),
     ("alt+l", "view.lsp_status"),
     ("ctrl+k ctrl+l", "view.lsp_status"),
     ("f1", "view.help"),

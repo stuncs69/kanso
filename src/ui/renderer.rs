@@ -1,16 +1,20 @@
 use std::io;
 
 use crate::buffer::{char_display_width, Position};
+use crate::config::DiagnosticsDisplay;
+use crate::editor::diagnostics::{self as diag, Diagnostic};
 use crate::editor::search::{self, Field};
 use crate::editor::Editor;
 
 use super::frame::{str_width, Frame, Style, WIDE_CONTINUATION};
+use super::layout::{self, ScreenRow};
 use super::statusline;
 use super::terminal::Terminal;
 use super::theme::Theme;
 
 const FIELD_X: u16 = 11;
 const MIN_FIELD_WIDTH: u16 = 20;
+const UNDERLINE: char = '─';
 
 pub struct Renderer {
     frame: Frame,
@@ -44,11 +48,13 @@ impl Renderer {
     fn compose(&mut self, editor: &Editor, theme: &Theme) -> Option<(u16, u16)> {
         let (width, height) = (editor.viewport.width, editor.viewport.height);
         self.frame.reset(width, height, theme.text());
-        self.render_text(editor, theme);
+        let rows = editor.screen_rows();
+        self.render_text(editor, theme, &rows);
         statusline::render(&mut self.frame, editor, theme, height - 1);
-        self.render_completion(editor, theme);
-        self.render_hover(editor, theme);
-        let mut cursor = cursor_screen_pos(editor);
+        self.render_diagnostic_popup(editor, theme, &rows);
+        self.render_completion(editor, theme, &rows);
+        self.render_hover(editor, theme, &rows);
+        let mut cursor = cursor_screen_pos(editor, &rows);
         if let Some(at) = self.render_search(editor, theme) {
             cursor = Some(at);
         }
@@ -60,7 +66,7 @@ impl Renderer {
         cursor
     }
 
-    fn render_text(&mut self, editor: &Editor, theme: &Theme) {
+    fn render_text(&mut self, editor: &Editor, theme: &Theme, rows: &[ScreenRow]) {
         let vp = &editor.viewport;
         let buffer = &editor.buffer;
         let gutter = editor.gutter_width();
@@ -79,9 +85,22 @@ impl Renderer {
             .as_ref()
             .and_then(crate::editor::search::Search::current_match);
 
-        for row in 0..vp.text_height() {
-            let line = vp.top_line + row;
+        let mode = editor.settings.diagnostics;
+        let inline_underline = mode.decorates_text() && mode != DiagnosticsDisplay::VirtualRows;
+
+        for (row, screen_row) in rows.iter().enumerate() {
             let y = row as u16;
+            let line = match *screen_row {
+                ScreenRow::Text(line) => line,
+                ScreenRow::Underline(line) => {
+                    self.render_underline_row(editor, theme, line, y);
+                    continue;
+                }
+                ScreenRow::Message { line, index } => {
+                    self.render_message_row(editor, theme, line, index, y);
+                    continue;
+                }
+            };
             if line >= buffer.len_lines() {
                 continue;
             }
@@ -91,12 +110,19 @@ impl Renderer {
                 let number = format!("{:>width$} ", line + 1, width = gutter as usize - 1);
                 let style = theme.line_number(line == buffer.cursor.pos.line);
                 self.frame.put_str(0, y, &number, style, gutter);
+                if mode.decorates_text() {
+                    if let Some(severity) = diag::line_severity(&editor.diagnostics, line) {
+                        let marker =
+                            Style::fg_bg(theme.diagnostic(severity), theme.editor_background);
+                        self.frame.set(0, y, severity.marker(), marker);
+                    }
+                }
             }
 
             let selected_cols = selection.as_ref().and_then(|sel| sel.line_cols(line));
             let spans = editor
                 .line_highlights
-                .get(row)
+                .get(line - vp.top_line)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let mut span_idx = 0usize;
@@ -119,6 +145,18 @@ impl Renderer {
                     Some(span) => theme.syntax(span.kind),
                     None => text_style,
                 };
+                if inline_underline {
+                    let at = Position::new(line, char_col);
+                    if let Some(hit) = editor
+                        .diagnostics
+                        .iter()
+                        .filter(|d| d.covers(at))
+                        .min_by_key(|d| d.severity)
+                    {
+                        style.underline = true;
+                        style.fg = theme.diagnostic(hit.severity);
+                    }
+                }
                 if selected {
                     style.bg = theme.editor_selection;
                 }
@@ -173,22 +211,137 @@ impl Renderer {
                     self.frame.set(x, y, ' ', selection_style);
                 }
             }
+
+            if mode == DiagnosticsDisplay::EndOfLine {
+                self.render_end_of_line(editor, theme, line, y, display_col);
+            }
         }
     }
 
-    fn render_completion(&mut self, editor: &Editor, theme: &Theme) {
+    fn render_end_of_line(
+        &mut self,
+        editor: &Editor,
+        theme: &Theme,
+        line: usize,
+        y: u16,
+        end_col: usize,
+    ) {
+        let vp = &editor.viewport;
+        let items: Vec<&Diagnostic> = diag::on_line(&editor.diagnostics, line).collect();
+        let Some(first) = items.iter().min_by_key(|d| d.severity) else {
+            return;
+        };
+        let gutter = editor.gutter_width();
+        let x = gutter + end_col.saturating_sub(vp.left_col) as u16 + 2;
+        if x + 4 >= vp.width {
+            return;
+        }
+        let extra = match items.len() {
+            0 | 1 => String::new(),
+            n => format!(" (+{})", n - 1),
+        };
+        let text = format!("{} {}{extra}", first.severity.glyph(), first.summary());
+        let style = Style::fg_bg(theme.diagnostic(first.severity), theme.editor_background);
+        self.frame.put_str(x, y, &text, style, vp.width);
+    }
+
+    fn render_underline_row(&mut self, editor: &Editor, theme: &Theme, line: usize, y: u16) {
+        let vp = &editor.viewport;
+        let gutter = editor.gutter_width();
+        let tab_width = editor.settings.tab_width;
+        for item in diag::on_line(&editor.diagnostics, line) {
+            let start = editor.buffer.display_col(item.start, tab_width);
+            let end = if item.end.line == line {
+                editor.buffer.display_col(item.end, tab_width)
+            } else {
+                start + 1
+            }
+            .max(start + 1);
+            let style = Style::fg_bg(theme.diagnostic(item.severity), theme.editor_background);
+            for col in start..end {
+                if col < vp.left_col {
+                    continue;
+                }
+                let x = gutter + (col - vp.left_col) as u16;
+                if x >= vp.width {
+                    break;
+                }
+                self.frame.set(x, y, UNDERLINE, style);
+            }
+        }
+    }
+
+    fn render_message_row(
+        &mut self,
+        editor: &Editor,
+        theme: &Theme,
+        line: usize,
+        index: usize,
+        y: u16,
+    ) {
+        let vp = &editor.viewport;
+        let Some(item) = diag::on_line(&editor.diagnostics, line).nth(index) else {
+            return;
+        };
+        let gutter = editor.gutter_width();
+        let start = editor
+            .buffer
+            .display_col(item.start, editor.settings.tab_width);
+        let text = format!("{} {}", item.severity.glyph(), item.summary());
+        let mut x = gutter + start.saturating_sub(vp.left_col) as u16;
+        let wanted = str_width(&text) as u16;
+        if x + wanted > vp.width {
+            x = vp.width.saturating_sub(wanted).max(gutter);
+        }
+        let style = Style::fg_bg(theme.diagnostic(item.severity), theme.editor_background);
+        self.frame.put_str(x, y, &text, style, vp.width);
+    }
+
+    fn render_diagnostic_popup(&mut self, editor: &Editor, theme: &Theme, rows: &[ScreenRow]) {
+        if editor.settings.diagnostics != DiagnosticsDisplay::Popup {
+            return;
+        }
+        if editor.hover.is_some() || editor.completion.is_some() {
+            return;
+        }
+        let Some(item) = editor.diagnostic_at_cursor() else {
+            return;
+        };
+        let Some(row) = layout::text_row(rows, item.start.line) else {
+            return;
+        };
+        let vp = &editor.viewport;
+        let text = format!("{} {}", item.severity.glyph(), item.summary());
+        let width = (str_width(&text) as u16 + 2).min(vp.width);
+        let gutter = editor.gutter_width();
+        let start = editor
+            .buffer
+            .display_col(item.start, editor.settings.tab_width);
+        let x =
+            (gutter + start.saturating_sub(vp.left_col) as u16).min(vp.width.saturating_sub(width));
+        let y = if (row as usize) + 1 < vp.text_height() {
+            row + 1
+        } else if row > 0 {
+            row - 1
+        } else {
+            return;
+        };
+        let style = Style::fg_bg(theme.diagnostic(item.severity), theme.popup_background);
+        for cell_x in x..x + width {
+            self.frame.set(cell_x, y, ' ', style);
+        }
+        self.frame.put_str(x + 1, y, &text, style, x + width - 1);
+    }
+
+    fn render_completion(&mut self, editor: &Editor, theme: &Theme, rows: &[ScreenRow]) {
         let Some(state) = &editor.completion else {
             return;
         };
         let vp = &editor.viewport;
         let pos = editor.buffer.cursor.pos;
-        if pos.line < vp.top_line {
+        let Some(row) = layout::text_row(rows, pos.line).map(usize::from) else {
             return;
-        }
-        let row = pos.line - vp.top_line;
-        if row >= vp.text_height() {
-            return;
-        }
+        };
 
         let max_height = state.items.len().min(8);
         let below = vp.text_height() - row - 1;
@@ -231,18 +384,14 @@ impl Renderer {
         }
     }
 
-    fn render_hover(&mut self, editor: &Editor, theme: &Theme) {
+    fn render_hover(&mut self, editor: &Editor, theme: &Theme, rows: &[ScreenRow]) {
         let Some(hover) = &editor.hover else {
             return;
         };
         let vp = &editor.viewport;
-        if hover.anchor.line < vp.top_line {
+        let Some(row) = layout::text_row(rows, hover.anchor.line).map(usize::from) else {
             return;
-        }
-        let row = hover.anchor.line - vp.top_line;
-        if row >= vp.text_height() {
-            return;
-        }
+        };
 
         let wanted = hover.lines.len().min(12);
         let (top_row, height) = if row >= wanted {
@@ -637,23 +786,18 @@ impl Renderer {
     }
 }
 
-fn cursor_screen_pos(editor: &Editor) -> Option<(u16, u16)> {
+fn cursor_screen_pos(editor: &Editor, rows: &[ScreenRow]) -> Option<(u16, u16)> {
     let vp = &editor.viewport;
     let pos = editor.buffer.cursor.pos;
     let gutter = editor.gutter_width();
     let display_col = editor.buffer.display_col(pos, editor.settings.tab_width);
 
-    if pos.line < vp.top_line || pos.line >= vp.top_line + vp.text_height() {
-        return None;
-    }
+    let row = layout::text_row(rows, pos.line)?;
     let text_width = vp.width.saturating_sub(gutter) as usize;
     if display_col < vp.left_col || display_col >= vp.left_col + text_width {
         return None;
     }
-    Some((
-        gutter + (display_col - vp.left_col) as u16,
-        (pos.line - vp.top_line) as u16,
-    ))
+    Some((gutter + (display_col - vp.left_col) as u16, row))
 }
 
 #[cfg(test)]
@@ -662,6 +806,7 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::config::Settings;
     use crate::editor::command::Command;
+    use crate::lsp::Severity;
 
     fn editor_with(text: &str, width: u16, height: u16) -> Editor {
         let mut buffer = Buffer::scratch();
@@ -817,5 +962,171 @@ mod tests {
         assert!(!joined.contains("readme.md"), "{joined}");
         assert!(row_text(&renderer, cursor.1).contains("› main"));
         assert_eq!(renderer.frame.row(cursor.1)[cursor.0 as usize].ch, ' ');
+    }
+
+    fn diagnose(editor: &mut Editor, line: usize, start: usize, end: usize, severity: Severity) {
+        let mut items: Vec<crate::lsp::Diagnostic> = editor
+            .diagnostics
+            .iter()
+            .map(|d| crate::lsp::Diagnostic {
+                start_line: d.start.line,
+                start_utf16: d.start.col,
+                end_line: d.end.line,
+                end_utf16: d.end.col,
+                severity: d.severity,
+                message: d.message.clone(),
+                source: None,
+            })
+            .collect();
+        items.push(crate::lsp::Diagnostic {
+            start_line: line,
+            start_utf16: start,
+            end_line: line,
+            end_utf16: end,
+            severity,
+            message: match severity {
+                Severity::Error => "undeclared identifier 'foo'".to_string(),
+                _ => "unused variable".to_string(),
+            },
+            source: None,
+        });
+        editor.set_diagnostics(&items);
+    }
+
+    #[test]
+    fn virtual_rows_push_following_lines_down() {
+        let theme = Theme::default();
+        let mut renderer = Renderer::new();
+        let mut editor = editor_with("let a = 1;\nlet b = 2;\nlet c = 3;\n", 60, 10);
+        diagnose(&mut editor, 0, 4, 5, Severity::Error);
+
+        renderer.compose(&editor, &theme);
+        let gutter = editor.gutter_width() as usize;
+        assert!(row_text(&renderer, 0).contains("let a = 1;"));
+        assert_eq!(row_text(&renderer, 1).trim(), "─");
+        assert_eq!(renderer.frame.row(1)[gutter + 4].ch, UNDERLINE);
+        assert!(row_text(&renderer, 2).contains("E undeclared identifier 'foo'"));
+        assert!(row_text(&renderer, 3).contains("let b = 2;"));
+        assert!(row_text(&renderer, 4).contains("let c = 3;"));
+    }
+
+    #[test]
+    fn virtual_rows_carry_severity_colors_and_a_gutter_marker() {
+        let theme = Theme::default();
+        let mut renderer = Renderer::new();
+        let mut editor = editor_with("let a = 1;\n", 60, 10);
+        diagnose(&mut editor, 0, 4, 5, Severity::Warning);
+
+        renderer.compose(&editor, &theme);
+        assert_eq!(renderer.frame.row(0)[0].ch, '▲');
+        assert_eq!(renderer.frame.row(0)[0].style.fg, theme.diagnostic_warning);
+        let gutter = editor.gutter_width() as usize;
+        assert_eq!(
+            renderer.frame.row(1)[gutter + 4].style.fg,
+            theme.diagnostic_warning
+        );
+        assert!(row_text(&renderer, 2).contains("W unused variable"));
+    }
+
+    #[test]
+    fn several_diagnostics_on_one_line_get_a_message_row_each() {
+        let theme = Theme::default();
+        let mut renderer = Renderer::new();
+        let mut editor = editor_with("let a = 1;\nlet b = 2;\n", 60, 10);
+        diagnose(&mut editor, 0, 0, 3, Severity::Error);
+        diagnose(&mut editor, 0, 4, 5, Severity::Warning);
+
+        renderer.compose(&editor, &theme);
+        assert!(row_text(&renderer, 0).contains("let a = 1;"));
+        assert!(row_text(&renderer, 1).contains('─'));
+        assert!(row_text(&renderer, 2).contains("E undeclared"));
+        assert!(row_text(&renderer, 3).contains("W unused"));
+        assert!(row_text(&renderer, 4).contains("let b = 2;"));
+    }
+
+    #[test]
+    fn cursor_and_mouse_agree_with_virtual_rows() {
+        let theme = Theme::default();
+        let mut renderer = Renderer::new();
+        let mut editor = editor_with("let a = 1;\nlet b = 2;\n", 60, 10);
+        diagnose(&mut editor, 0, 4, 5, Severity::Error);
+        editor.buffer.set_cursor_pos(Position::new(1, 2), false);
+        editor.sync_viewport();
+
+        let cursor = renderer.compose(&editor, &theme).unwrap();
+        assert_eq!(cursor.1, 3);
+        let hit = editor.text_position_at(cursor.0, cursor.1).unwrap();
+        assert_eq!(hit, Position::new(1, 2));
+        assert_eq!(editor.text_position_at(0, 2).unwrap().line, 0);
+    }
+
+    #[test]
+    fn virtual_rows_scroll_so_the_cursor_line_stays_visible() {
+        let theme = Theme::default();
+        let mut renderer = Renderer::new();
+        let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let mut editor = editor_with(&text, 60, 6);
+        for line in 0..20 {
+            diagnose(&mut editor, line, 0, 4, Severity::Error);
+        }
+        editor.buffer.set_cursor_pos(Position::new(10, 0), false);
+        editor.sync_viewport();
+
+        let cursor = renderer.compose(&editor, &theme).unwrap();
+        assert!(row_text(&renderer, cursor.1).contains("line 10"));
+        assert!(cursor.1 < editor.viewport.text_height() as u16);
+    }
+
+    #[test]
+    fn end_of_line_mode_keeps_one_row_per_line() {
+        let theme = Theme::default();
+        let mut renderer = Renderer::new();
+        let mut editor = editor_with("let a = 1;\nlet b = 2;\n", 60, 10);
+        editor.settings.diagnostics = DiagnosticsDisplay::EndOfLine;
+        diagnose(&mut editor, 0, 4, 5, Severity::Error);
+
+        renderer.compose(&editor, &theme);
+        let first = row_text(&renderer, 0);
+        assert!(first.contains("let a = 1;"), "{first:?}");
+        assert!(first.contains("E undeclared identifier 'foo'"), "{first:?}");
+        assert!(row_text(&renderer, 1).contains("let b = 2;"));
+        let gutter = editor.gutter_width() as usize;
+        assert!(renderer.frame.row(0)[gutter + 4].style.underline);
+    }
+
+    #[test]
+    fn popup_mode_floats_under_the_cursor_diagnostic() {
+        let theme = Theme::default();
+        let mut renderer = Renderer::new();
+        let mut editor = editor_with("let a = 1;\nlet b = 2;\n", 60, 10);
+        editor.settings.diagnostics = DiagnosticsDisplay::Popup;
+        diagnose(&mut editor, 0, 4, 5, Severity::Error);
+        editor.buffer.set_cursor_pos(Position::new(0, 4), false);
+        editor.sync_viewport();
+
+        renderer.compose(&editor, &theme);
+        assert!(row_text(&renderer, 0).contains("let a = 1;"));
+        let popup = row_text(&renderer, 1);
+        assert!(popup.contains("E undeclared identifier 'foo'"), "{popup:?}");
+
+        editor.buffer.set_cursor_pos(Position::new(1, 0), false);
+        editor.sync_viewport();
+        renderer.compose(&editor, &theme);
+        assert!(row_text(&renderer, 1).contains("let b = 2;"));
+    }
+
+    #[test]
+    fn off_mode_leaves_the_text_untouched() {
+        let theme = Theme::default();
+        let mut renderer = Renderer::new();
+        let mut editor = editor_with("let a = 1;\nlet b = 2;\n", 60, 10);
+        editor.settings.diagnostics = DiagnosticsDisplay::Off;
+        diagnose(&mut editor, 0, 4, 5, Severity::Error);
+
+        renderer.compose(&editor, &theme);
+        assert_eq!(row_text(&renderer, 0).trim(), "1 let a = 1;");
+        assert!(row_text(&renderer, 1).contains("let b = 2;"));
+        let gutter = editor.gutter_width() as usize;
+        assert!(!renderer.frame.row(0)[gutter + 4].style.underline);
     }
 }

@@ -4,6 +4,7 @@ use std::path::Path;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::lsp::Severity;
 use crate::syntax::TokenKind;
 
 use super::frame::{Color, Style};
@@ -31,6 +32,10 @@ pub struct Theme {
     pub popup_selected: Color,
     pub search_match: Color,
     pub search_current: Color,
+    pub diagnostic_error: Color,
+    pub diagnostic_warning: Color,
+    pub diagnostic_info: Color,
+    pub diagnostic_hint: Color,
 }
 
 impl Default for Theme {
@@ -57,6 +62,10 @@ impl Default for Theme {
             popup_selected: Color::Rgb(0x3e, 0x46, 0x5a),
             search_match: Color::Rgb(0x45, 0x51, 0x5f),
             search_current: Color::Rgb(0x7d, 0x62, 0x2f),
+            diagnostic_error: Color::Rgb(0xbf, 0x61, 0x6a),
+            diagnostic_warning: Color::Rgb(0xeb, 0xcb, 0x8b),
+            diagnostic_info: Color::Rgb(0x88, 0xc0, 0xd0),
+            diagnostic_hint: Color::Rgb(0x8f, 0xbc, 0xbb),
         }
     }
 }
@@ -97,6 +106,15 @@ impl Theme {
         style
     }
 
+    pub fn diagnostic(&self, severity: Severity) -> Color {
+        match severity {
+            Severity::Error => self.diagnostic_error,
+            Severity::Warning => self.diagnostic_warning,
+            Severity::Info => self.diagnostic_info,
+            Severity::Hint => self.diagnostic_hint,
+        }
+    }
+
     pub fn popup(&self, selected: bool) -> Style {
         let bg = if selected {
             self.popup_selected
@@ -129,6 +147,10 @@ impl Theme {
             "popup.selected" => &mut self.popup_selected,
             "search.match" => &mut self.search_match,
             "search.current" => &mut self.search_current,
+            "diagnostic.error" => &mut self.diagnostic_error,
+            "diagnostic.warning" => &mut self.diagnostic_warning,
+            "diagnostic.info" => &mut self.diagnostic_info,
+            "diagnostic.hint" => &mut self.diagnostic_hint,
             _ => return false,
         };
         *slot = color;

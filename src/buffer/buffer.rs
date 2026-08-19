@@ -110,6 +110,23 @@ impl Buffer {
             .sum()
     }
 
+    pub fn col_from_utf16(&self, line: usize, utf16_col: usize) -> usize {
+        if line >= self.len_lines() {
+            return 0;
+        }
+        let mut remaining = utf16_col;
+        let mut col = 0;
+        for ch in self.line_chars(line) {
+            let width = ch.len_utf16();
+            if remaining < width {
+                break;
+            }
+            remaining -= width;
+            col += 1;
+        }
+        col
+    }
+
     pub fn text(&self) -> String {
         self.rope.to_string()
     }

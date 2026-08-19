@@ -11,12 +11,61 @@ pub enum Reply {
     Failed(String),
     Completion { id: u64, items: Vec<String> },
     Hover { id: u64, text: Option<String> },
+    Diagnostics { uri: String, items: Vec<Diagnostic> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+impl Severity {
+    pub fn glyph(self) -> char {
+        match self {
+            Severity::Error => 'E',
+            Severity::Warning => 'W',
+            Severity::Info => 'I',
+            Severity::Hint => 'H',
+        }
+    }
+
+    pub fn marker(self) -> char {
+        match self {
+            Severity::Error => '●',
+            Severity::Warning => '▲',
+            Severity::Info | Severity::Hint => '·',
+        }
+    }
+
+    fn from_code(code: Option<u64>) -> Severity {
+        match code {
+            Some(2) => Severity::Warning,
+            Some(3) => Severity::Info,
+            Some(4) => Severity::Hint,
+            _ => Severity::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub start_line: usize,
+    pub start_utf16: usize,
+    pub end_line: usize,
+    pub end_utf16: usize,
+    pub severity: Severity,
+    pub message: String,
+    pub source: Option<String>,
 }
 
 enum Pending {
     Initialize,
     Completion,
     Hover,
+    PullDiagnostics(String),
 }
 
 pub struct LspClient {
@@ -26,6 +75,8 @@ pub struct LspClient {
     pending: HashMap<u64, Pending>,
     latest_completion: u64,
     latest_hover: u64,
+    latest_pull: u64,
+    pull_diagnostics: bool,
     pub ready: bool,
     pub name: String,
     language_id: String,
@@ -42,11 +93,16 @@ pub fn spawn(
     let program = parts
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty server command"))?;
+    let debug_path = std::env::var("KANSO_DEBUG_LOG").ok();
     let mut child = Command::new(program)
         .args(parts)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(if debug_path.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .spawn()?;
     let stdout = child.stdout.take().expect("stdout was piped");
     let stdin = child.stdin.take().expect("stdin was piped");
@@ -54,6 +110,9 @@ pub fn spawn(
         read_loop(stdout, &forward);
         forward(Value::Null);
     });
+    if let (Some(path), Some(stderr)) = (debug_path, child.stderr.take()) {
+        std::thread::spawn(move || log_stderr(stderr, &path));
+    }
 
     let name = Path::new(program)
         .file_name()
@@ -67,6 +126,8 @@ pub fn spawn(
         pending: HashMap::new(),
         latest_completion: 0,
         latest_hover: 0,
+        latest_pull: 0,
+        pull_diagnostics: false,
         ready: false,
         name,
         language_id: language_id.to_string(),
@@ -86,6 +147,13 @@ pub fn spawn(
                 "textDocument": {
                     "completion": { "completionItem": { "snippetSupport": false } },
                     "hover": { "contentFormat": ["plaintext", "markdown"] },
+                    "diagnostic": { "dynamicRegistration": false },
+                    "synchronization": { "didSave": true },
+                    "publishDiagnostics": {
+                        "relatedInformation": false,
+                        "versionSupport": false,
+                        "tagSupport": { "valueSet": [1, 2] },
+                    },
                 },
             },
             "workspaceFolders": [{ "uri": root_uri, "name": root_name }],
@@ -101,7 +169,7 @@ impl LspClient {
             return Ok(Reply::Failed(format!("{} exited", self.name)));
         }
         let Some(id) = msg.get("id").cloned() else {
-            return Ok(Reply::None);
+            return Ok(self.handle_notification(&msg));
         };
         if msg.get("method").is_some() {
             self.answer_server_request(&msg, id)?;
@@ -121,10 +189,14 @@ impl LspClient {
                     .unwrap_or("initialize failed");
                 return Ok(Reply::Failed(format!("{}: {message}", self.name)));
             }
+            return Ok(Reply::None);
         }
         let result = msg.get("result").cloned().unwrap_or(Value::Null);
         match pending {
             Pending::Initialize => {
+                self.pull_diagnostics = result
+                    .pointer("/capabilities/diagnosticProvider")
+                    .is_some_and(|v| !v.is_null());
                 self.notify("initialized", json!({}))?;
                 self.ready = true;
                 Ok(Reply::Ready)
@@ -147,6 +219,33 @@ impl LspClient {
                     text: parse_hover(&result),
                 })
             }
+            Pending::PullDiagnostics(uri) => {
+                if id != self.latest_pull
+                    || result.get("kind").and_then(Value::as_str) == Some("unchanged")
+                {
+                    return Ok(Reply::None);
+                }
+                Ok(Reply::Diagnostics {
+                    uri,
+                    items: parse_diagnostics(result.get("items")),
+                })
+            }
+        }
+    }
+
+    fn handle_notification(&mut self, msg: &Value) -> Reply {
+        if msg.get("method").and_then(Value::as_str) != Some("textDocument/publishDiagnostics") {
+            return Reply::None;
+        }
+        let Some(params) = msg.get("params") else {
+            return Reply::None;
+        };
+        let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+            return Reply::None;
+        };
+        Reply::Diagnostics {
+            uri: uri.to_string(),
+            items: parse_diagnostics(params.get("diagnostics")),
         }
     }
 
@@ -207,6 +306,26 @@ impl LspClient {
         Ok(id)
     }
 
+    pub fn supports_pull(&self) -> bool {
+        self.pull_diagnostics
+    }
+
+    pub fn pull_diagnostics(&mut self, uri: &str) -> io::Result<u64> {
+        let params = json!({ "textDocument": { "uri": uri } });
+        let id = self.request(
+            "textDocument/diagnostic",
+            params,
+            Pending::PullDiagnostics(uri.to_string()),
+        )?;
+        self.latest_pull = id;
+        Ok(id)
+    }
+
+    pub fn did_save(&mut self, uri: &str) -> io::Result<()> {
+        let params = json!({ "textDocument": { "uri": uri } });
+        self.notify("textDocument/didSave", params)
+    }
+
     pub fn shutdown(&mut self) {
         let _ = self.request("shutdown", Value::Null, Pending::Initialize);
         let _ = self.notify("exit", Value::Null);
@@ -235,6 +354,19 @@ impl Drop for LspClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+fn log_stderr(stderr: std::process::ChildStderr, path: &str) {
+    let reader = BufReader::new(stderr);
+    for line in reader.lines().map_while(Result::ok) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "stderr: {line}");
+        }
     }
 }
 
@@ -303,6 +435,49 @@ fn parse_completion_items(result: &Value) -> Vec<String> {
         }
     }
     out
+}
+
+fn parse_diagnostics(list: Option<&Value>) -> Vec<Diagnostic> {
+    let Some(items) = list.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Some(message) = item.get("message").and_then(Value::as_str) else {
+            continue;
+        };
+        let message = message.trim();
+        if message.is_empty() {
+            continue;
+        }
+        let start_line = position_field(item, "start", "line");
+        let start_utf16 = position_field(item, "start", "character");
+        let end_line = position_field(item, "end", "line").max(start_line);
+        let end_utf16 = position_field(item, "end", "character");
+        out.push(Diagnostic {
+            start_line,
+            start_utf16,
+            end_line,
+            end_utf16,
+            severity: Severity::from_code(item.get("severity").and_then(Value::as_u64)),
+            message: message.to_string(),
+            source: item
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+        if out.len() >= 500 {
+            break;
+        }
+    }
+    out.sort_by_key(|d| (d.start_line, d.start_utf16, d.severity));
+    out
+}
+
+fn position_field(item: &Value, edge: &str, field: &str) -> usize {
+    item.pointer(&format!("/range/{edge}/{field}"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
 }
 
 fn parse_hover(result: &Value) -> Option<String> {
@@ -427,36 +602,112 @@ mod tests {
         .expect("mock server should spawn");
 
         let deadline = Instant::now() + Duration::from_secs(5);
+        let uri = file_uri(&file);
         let mut ready = false;
         let mut items = None;
         let mut hover = None;
-        while Instant::now() < deadline && (items.is_none() || hover.is_none()) {
+        let mut published: Option<Vec<Diagnostic>> = None;
+        let mut pulled = false;
+        let mut pulled_after_save = false;
+        while Instant::now() < deadline
+            && (items.is_none() || hover.is_none() || published.is_none() || !pulled_after_save)
+        {
             let Ok(msg) = rx.recv_timeout(Duration::from_millis(200)) else {
                 continue;
             };
             match client.handle_message(msg).unwrap() {
                 Reply::Ready => {
                     ready = true;
-                    let uri = file_uri(&file);
+                    assert!(client.supports_pull());
                     client.did_open(&uri, "fn main() {}").unwrap();
                     client.did_change(&uri, "fn main() { }").unwrap();
                     assert!(client.is_open(&uri));
                     client.completion(&uri, 0, 3).unwrap();
                     client.hover(&uri, 0, 3).unwrap();
+                    client.pull_diagnostics(&uri).unwrap();
                 }
                 Reply::Completion { items: found, .. } => items = Some(found),
                 Reply::Hover { text, .. } => hover = Some(text),
+                Reply::Diagnostics { uri: got, items } => {
+                    assert_eq!(got, uri);
+                    match items.first().map(|d| d.message.as_str()) {
+                        Some("pulled") => {
+                            pulled = true;
+                            client.did_save(&uri).unwrap();
+                            client.pull_diagnostics(&uri).unwrap();
+                        }
+                        Some("after save") => pulled_after_save = true,
+                        _ => published = Some(items),
+                    }
+                }
                 Reply::Failed(e) => panic!("server failed: {e}"),
                 Reply::None => {}
             }
         }
         assert!(ready);
+        assert!(pulled);
+        assert!(pulled_after_save);
         assert_eq!(
             items.expect("completion reply"),
             vec!["mock_alpha", "mock_beta", "mock_gamma"]
         );
         let hover = hover.expect("hover reply").expect("hover text");
         assert!(hover.contains("Mock hover docs"));
+        let published = published.expect("diagnostics notification");
+        assert_eq!(published.len(), 2);
+        assert_eq!(published[0].severity, Severity::Warning);
+        assert_eq!(published[0].start_utf16, 0);
+        assert_eq!(published[1].severity, Severity::Error);
+        assert_eq!(published[1].start_utf16, 3);
+        assert_eq!(published[1].end_utf16, 7);
+        assert_eq!(published[1].source.as_deref(), Some("mock"));
         client.shutdown();
+    }
+
+    #[test]
+    fn clangd_publishes_diagnostics_for_broken_code() {
+        if crate::lsp::default_server("cpp", Path::new("/tmp/x.cpp")).is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kanso-clangd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
+        let file = dir.join("main.cpp");
+        let source = "#include <iostream>\nint main() {\n  std::cout << foo;\n  return 0;\n}\n";
+        std::fs::write(&file, source).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let mut client = spawn("clangd", &file, "cpp", move |msg| {
+            let _ = tx.send(msg);
+        })
+        .expect("clangd should spawn");
+
+        let uri = file_uri(&file);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut published = None;
+        while Instant::now() < deadline && published.is_none() {
+            let Ok(msg) = rx.recv_timeout(Duration::from_millis(500)) else {
+                continue;
+            };
+            match client.handle_message(msg).unwrap() {
+                Reply::Ready => client.did_open(&uri, source).unwrap(),
+                Reply::Diagnostics { uri: got, items } if got == uri && !items.is_empty() => {
+                    published = Some(items)
+                }
+                _ => {}
+            }
+        }
+        client.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let published = published.expect("clangd should report the undeclared identifier");
+        let error = published
+            .iter()
+            .find(|d| d.severity == Severity::Error)
+            .expect("an error severity diagnostic");
+        assert_eq!(error.start_line, 2);
+        assert!(error.message.contains("foo"), "{}", error.message);
+        assert!(error.end_utf16 > error.start_utf16);
     }
 }

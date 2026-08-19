@@ -6,7 +6,7 @@ Kanso is non-modal and keyboard-first. The default keybindings follow VS
 Code. Without any configuration you get:
 
 - Syntax highlighting
-- LSP completions and hover docs
+- LSP completions, hover docs, and diagnostics
 - Autocomplete as you type
 - Find and replace, with every match highlighted
 - Fuzzy file finder over the whole project
@@ -62,6 +62,7 @@ rebound. Arrows and page keys scroll the list, `Esc` closes it.
 | `Ctrl+Left/Right` | word movement, add `Shift` to select |
 | `Ctrl+Space` | completion, `Tab` or `Enter` accepts, `Esc` dismisses |
 | `Alt+H` | hover docs, or rest the mouse on a symbol |
+| `F8` / `Shift+F8` | next / previous diagnostic |
 | `Alt+L` | language server overview |
 
 Every action is a command with a stable id (`file.save`, `cursor.word_left`
@@ -82,6 +83,7 @@ syntax_highlighting = true
 auto_pairs = true
 mouse = true
 lsp = true
+diagnostics = "virtual_rows"  # virtual_rows, end_of_line, popup, off
 cursor_style = "block"   # block, bar, underline
 theme = "my-theme"       # themes/my-theme.toml
 
@@ -106,7 +108,8 @@ rust = "rust-analyzer"
 Theme roles: `editor.background/foreground/selection`,
 `line_number.normal/active`, `statusline.background/foreground`,
 `ui.accent/warning/error`, `syntax.keyword/string/comment/function/type/number`,
-`popup.background/foreground/selected`, `search.match/current`.
+`popup.background/foreground/selected`, `search.match/current`,
+`diagnostic.error/warning/info/hint`.
 
 ## Search and replace
 
@@ -149,6 +152,31 @@ exist for `rust-analyzer`, `gopls`, `clangd`, `pylsp`, and
 TypeScript/JavaScript. For TypeScript the native LSP built into TypeScript
 7 is preferred, so `bun install -g typescript` works without node. Press
 `Alt+L` to see what was detected.
+
+## Diagnostics
+
+Errors and warnings arrive from the language server and are shown as you
+type. The gutter marks affected lines, the statusline keeps a running
+`E 2  W 4` count, and `F8` / `Shift+F8` walk the list, wrapping at the
+ends and printing the full message on the statusline.
+
+How the message itself is drawn is up to `diagnostics` in `config.toml`:
+
+- `virtual_rows` (default) underlines the range on its own row and writes
+  each message underneath, pushing the following lines down:
+
+  ```
+    17 │     std::cout << foo;
+                        ───
+                        E Use of undeclared identifier 'foo' [clang]
+    18 │     return 0;
+  ```
+
+- `end_of_line` underlines the range in place and appends the message
+  after the code, so no line ever moves.
+- `popup` underlines the range and floats only the diagnostic under the
+  cursor over the line below.
+- `off` leaves the buffer alone; the statusline and `F8` still work.
 
 ## Plugins
 

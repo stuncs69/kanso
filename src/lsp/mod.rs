@@ -2,7 +2,7 @@ mod client;
 
 use std::path::{Path, PathBuf};
 
-pub use client::{file_uri, spawn, LspClient, Reply};
+pub use client::{file_uri, spawn, Diagnostic, LspClient, Reply, Severity};
 
 pub fn default_server(lsp_id: &str, file_path: &Path) -> Option<String> {
     if matches!(lsp_id, "javascript" | "typescript") {

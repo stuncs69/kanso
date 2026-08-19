@@ -16,6 +16,7 @@ pub struct Settings {
     pub auto_pairs: bool,
     pub mouse: bool,
     pub lsp: bool,
+    pub diagnostics: DiagnosticsDisplay,
     pub cursor_style: CursorStyle,
     pub theme: Option<String>,
     pub language_servers: HashMap<String, String>,
@@ -33,10 +34,26 @@ impl Default for Settings {
             auto_pairs: true,
             mouse: true,
             lsp: true,
+            diagnostics: DiagnosticsDisplay::VirtualRows,
             cursor_style: CursorStyle::Block,
             theme: None,
             language_servers: HashMap::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticsDisplay {
+    VirtualRows,
+    EndOfLine,
+    Popup,
+    Off,
+}
+
+impl DiagnosticsDisplay {
+    pub fn decorates_text(self) -> bool {
+        self != DiagnosticsDisplay::Off
     }
 }
 
