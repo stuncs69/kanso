@@ -1,0 +1,179 @@
+name: build binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "optional: v0.1.0 - also creates a DRAFT release; blank = artifacts only"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name=="kanso") | .version')
+          if [ -z "$version" ]; then
+            echo "::error::could not read the kanso version from Cargo.toml"
+            exit 1
+          fi
+          if [ -n "$TAG" ] && [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version, expected v$version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ -n "$TAG" ]; then
+            echo "building kanso $version, draft release $TAG" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "building kanso $version, artifacts only" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: tar
+            smoke: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            archive: tar
+            smoke: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            smoke: true
+          - target: aarch64-apple-darwin
+            os: macos-15
+            archive: tar
+            smoke: true
+          - target: x86_64-apple-darwin
+            os: macos-15
+            archive: tar
+            smoke: false
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -C strip=symbols
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: smoke test
+        if: matrix.smoke
+        shell: bash
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          "target/${{ matrix.target }}/release/kanso$ext" --version
+
+      - name: stage
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p staging dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "target/$TARGET/release/kanso.exe" staging/
+          else
+            cp "target/$TARGET/release/kanso" staging/
+          fi
+          cp README.md LICENSE staging/
+          echo "ARCHIVE_BASE=kanso-$VERSION-$TARGET" >> "$GITHUB_ENV"
+
+      - name: archive tar.gz
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: tar -czf "dist/$ARCHIVE_BASE.tar.gz" -C staging kanso README.md LICENSE
+
+      - name: archive zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path staging/* -DestinationPath "dist/$env:ARCHIVE_BASE.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kanso-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  bundle:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kanso-*
+          merge-multiple: true
+          path: dist
+
+      - name: checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum kanso-* > SHA256SUMS
+          {
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: draft release
+        if: needs.prepare.outputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "kanso $VERSION" \
+            --draft \
+            --generate-notes \
+            dist/*
