@@ -81,13 +81,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
+      - name: setup rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
 
       - name: build
         run: cargo build --release --locked --target ${{ matrix.target }}
