@@ -8,6 +8,7 @@ use mlua::{
 };
 
 use crate::input::KeyPress;
+use crate::syntax::{self, LanguageDef};
 
 use super::events::Event;
 
@@ -69,6 +70,7 @@ pub(super) fn install(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> LuaResult<()> 
     kanso.set("keymap", keymap_table(lua, shared)?)?;
     kanso.set("events", events_table(lua)?)?;
     kanso.set("ui", ui_table(lua, shared)?)?;
+    kanso.set("syntax", syntax_table(lua)?)?;
     lua.globals().set("kanso", kanso)?;
     Ok(())
 }
@@ -119,6 +121,75 @@ fn keymap_table(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> LuaResult<Table> {
         })?,
     )?;
     Ok(table)
+}
+
+fn syntax_table(lua: &Lua) -> LuaResult<Table> {
+    let table = lua.create_table()?;
+    table.set(
+        "register",
+        lua.create_function(|_, spec: Table| {
+            let def = language_def(&spec)?;
+            syntax::register(def).map_err(LuaError::runtime)
+        })?,
+    )?;
+    Ok(table)
+}
+
+fn language_def(spec: &Table) -> LuaResult<LanguageDef> {
+    Ok(LanguageDef {
+        name: spec.get::<Option<String>>("name")?.unwrap_or_default(),
+        lsp_id: spec.get::<Option<String>>("lsp_id")?.unwrap_or_default(),
+        extensions: strings(spec, "extensions")?,
+        filenames: strings(spec, "filenames")?,
+        keywords: strings(spec, "keywords")?,
+        types: strings(spec, "types")?,
+        line_comment: spec.get::<Option<String>>("line_comment")?,
+        block_comment: block_comment(spec)?,
+        nested_block_comments: flag(spec, "nested_block_comments")?,
+        string_delims: chars(spec, "string_delims")?,
+        multiline_string_delims: chars(spec, "multiline_string_delims")?,
+        triple_quote_delims: chars(spec, "triple_quote_delims")?,
+        char_literal: flag(spec, "char_literal")?,
+        uppercase_types: flag(spec, "uppercase_types")?,
+        macro_bang: flag(spec, "macro_bang")?,
+        colon_indent: flag(spec, "colon_indent")?,
+        case_insensitive_keywords: flag(spec, "case_insensitive_keywords")?,
+    })
+}
+
+/// `block_comment = { "/*", "*/" }`
+fn block_comment(spec: &Table) -> LuaResult<Option<(String, String)>> {
+    let pair = strings(spec, "block_comment")?;
+    match <[String; 2]>::try_from(pair) {
+        Ok([open, close]) => Ok(Some((open, close))),
+        Err(pair) if pair.is_empty() => Ok(None),
+        Err(_) => Err(LuaError::runtime(
+            "block_comment must be a table of exactly two strings",
+        )),
+    }
+}
+
+fn flag(spec: &Table, key: &str) -> LuaResult<bool> {
+    Ok(spec.get::<Option<bool>>(key)?.unwrap_or(false))
+}
+
+fn strings(spec: &Table, key: &str) -> LuaResult<Vec<String>> {
+    Ok(spec.get::<Option<Vec<String>>>(key)?.unwrap_or_default())
+}
+
+fn chars(spec: &Table, key: &str) -> LuaResult<Vec<char>> {
+    strings(spec, key)?
+        .into_iter()
+        .map(|value| {
+            let mut it = value.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => Ok(c),
+                _ => Err(LuaError::runtime(format!(
+                    "{key}: `{value}` must be a single character"
+                ))),
+            }
+        })
+        .collect()
 }
 
 fn events_table(lua: &Lua) -> LuaResult<Table> {

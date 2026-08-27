@@ -5,7 +5,7 @@ A fast, riceable terminal text editor.
 Kanso is non-modal and keyboard-first. The default keybindings follow VS
 Code. Without any configuration you get:
 
-- Syntax highlighting
+- Syntax highlighting for 22 languages, extensible from a plugin
 - LSP completions, hover docs, and diagnostics
 - Autocomplete as you type
 - Find and replace, with every match highlighted
@@ -148,10 +148,21 @@ selected lines, or the current one when nothing is selected, and
 
 Kanso finds servers on its own: your config first, then `PATH` and the
 common install directories (`~/.cargo/bin`, `~/go/bin`, `~/.bun`). Defaults
-exist for `rust-analyzer`, `gopls`, `clangd`, `pylsp`, and
+exist for `rust-analyzer`, `gopls`, `clangd`, `pylsp`, `jdtls`, `csharp-ls`,
+`kotlin-language-server`, `sourcekit-lsp`, `ruby-lsp`, `intelephense`,
+`lua-language-server`, the vscode HTML/CSS servers, and
 TypeScript/JavaScript. For TypeScript the native LSP built into TypeScript
 7 is preferred, so `bun install -g typescript` works without node. Press
 `Alt+L` to see what was detected.
+
+## Languages
+
+Highlighting is detected from the extension, or the filename for the ones
+that have no extension (`Gemfile`, `.zshrc`): Rust, C, C++, C#, Java,
+Kotlin, Swift, Go, Python, Ruby, PHP, Lua, JavaScript, TypeScript, SQL,
+Shell, HTML/XML, CSS/SCSS, Markdown, JSON, YAML, TOML. A language also
+feeds the autocomplete word list, so its keywords are suggested as you
+type. Plugins can add more with `kanso.syntax.register`.
 
 ## Diagnostics
 
@@ -202,6 +213,33 @@ kanso.keymap.bind(keys, command)       -- same key syntax as keybindings.toml
 kanso.events.subscribe(event, fn)      -- buffer_opened, buffer_saved, buffer_changed
 kanso.ui.notify(message)               -- status message until the next one
 kanso.ui.set_status_message(msg, ms)   -- status message that clears itself
+kanso.syntax.register(spec)            -- add a language for highlighting
+```
+
+`kanso.syntax.register` takes one table. Only `name` plus either
+`extensions` or `filenames` is required; everything else defaults to off.
+Registered languages are checked before the built-ins, so this also
+overrides one.
+
+```lua
+kanso.syntax.register({
+    name = "Nim",
+    extensions = { "nim", "nims" },
+    lsp_id = "nim",                         -- "" or absent means no LSP
+    keywords = { "proc", "func", "var", "let", "if", "else", "return" },
+    types = { "int", "string", "bool", "seq" },
+    line_comment = "#",
+    block_comment = { "#[", "]#" },
+    nested_block_comments = true,
+    string_delims = { '"' },                -- single characters
+    multiline_string_delims = {},           -- delims that may span lines
+    triple_quote_delims = { '"' },          -- """...""" strings
+    char_literal = true,                    -- 'c' is a literal, not a quote
+    uppercase_types = true,                 -- Capitalised words are types
+    macro_bang = false,                     -- name! is a macro call
+    colon_indent = false,                   -- a trailing : opens a block
+    case_insensitive_keywords = false,      -- as SQL does
+})
 ```
 
 Plugin commands are ordinary kanso commands: they get an id, show up in the

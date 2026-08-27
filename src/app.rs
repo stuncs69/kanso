@@ -470,7 +470,10 @@ impl App {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         let mut lines = Vec::new();
-        for spec in syntax::LANGUAGES.iter().filter(|s| !s.lsp_id.is_empty()) {
+        for spec in syntax::languages()
+            .into_iter()
+            .filter(|s| !s.lsp_id.is_empty())
+        {
             let configured = self
                 .editor
                 .settings

@@ -175,6 +175,40 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Mutates the process-global language registry, so it stays a single test
+    /// using an extension no built-in claims.
+    #[test]
+    fn syntax_registration_adds_a_language() {
+        let host = host();
+        exec(
+            &host,
+            r##"kanso.syntax.register({
+                name = "Nim",
+                extensions = { "NIM" },
+                keywords = { "proc", "var" },
+                line_comment = "#",
+                block_comment = { "#[", "]#" },
+                colon_indent = true,
+            })"##,
+        )
+        .unwrap();
+        let spec = crate::syntax::detect(Some(std::path::Path::new("x.nim"))).unwrap();
+        assert_eq!(spec.name, "Nim");
+        assert_eq!(spec.extensions, ["nim"]);
+        assert_eq!(spec.block_comment, Some(("#[", "]#")));
+        assert!(spec.colon_indent);
+        assert!(!spec.char_literal);
+
+        let err = exec(&host, "kanso.syntax.register({ name = 'Bad' })").unwrap_err();
+        assert!(err.to_string().contains("extension or filename"));
+        let err = exec(
+            &host,
+            "kanso.syntax.register({ name = 'Bad', extensions = {'bad'}, string_delims = {'ab'} })",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("single character"));
+    }
+
     #[test]
     fn command_registration_exposes_a_handle() {
         let host = host();
