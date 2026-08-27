@@ -79,10 +79,6 @@ fn language_name(path: Option<&Path>) -> &'static str {
         return "Plain Text";
     };
     match ext.to_ascii_lowercase().as_str() {
-        "md" | "markdown" => "Markdown",
-        "html" | "htm" => "HTML",
-        "css" => "CSS",
-        "lua" => "Lua",
         "vx" => "Vexel",
         _ => "Plain Text",
     }
