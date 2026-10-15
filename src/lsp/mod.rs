@@ -2,7 +2,7 @@ mod client;
 
 use std::path::{Path, PathBuf};
 
-pub use client::{file_uri, spawn, Diagnostic, LspClient, Reply, Severity};
+pub use client::{file_uri, spawn, uri_key, Diagnostic, LspClient, Reply, Severity};
 
 pub fn default_server(lsp_id: &str, file_path: &Path) -> Option<String> {
     if matches!(lsp_id, "javascript" | "typescript") {
@@ -59,8 +59,8 @@ fn native_typescript_lsp(file_path: &Path) -> Option<String> {
     roots.push(PathBuf::from("/usr/lib/node_modules"));
     roots.push(PathBuf::from("/usr/local/lib/node_modules"));
     for root in roots {
-        let exe = root.join("@typescript").join(&package).join("lib/tsc");
-        if is_executable(&exe) {
+        let tsc = root.join("@typescript").join(&package).join("lib/tsc");
+        if let Some(exe) = executable_variant(&tsc) {
             return Some(format!("{} --lsp --stdio", exe.display()));
         }
     }
@@ -92,16 +92,37 @@ fn expand_home(command_line: &str) -> String {
 }
 
 fn command_available(command_line: &str) -> bool {
-    let Some(program) = command_line.split_whitespace().next() else {
-        return false;
-    };
-    if program.contains('/') {
-        return is_executable(Path::new(program));
+    command_line
+        .split_whitespace()
+        .next()
+        .and_then(resolve_program)
+        .is_some()
+}
+
+pub(crate) fn resolve_program(program: &str) -> Option<PathBuf> {
+    if program.chars().any(std::path::is_separator) {
+        return executable_variant(Path::new(program));
     }
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|dir| is_executable(&dir.join(program)))
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| executable_variant(&dir.join(program)))
+}
+
+fn executable_variant(path: &Path) -> Option<PathBuf> {
+    if cfg!(windows) && path.extension().is_none() {
+        let pathext = std::env::var("PATHEXT").unwrap_or_default();
+        let listed = pathext.split(';').filter(|ext| {
+            [".com", ".exe", ".bat", ".cmd"].contains(&ext.to_ascii_lowercase().as_str())
+        });
+        return listed
+            .chain([".exe", ".cmd", ".bat", ".com"])
+            .map(|ext| {
+                let mut name = path.as_os_str().to_owned();
+                name.push(ext);
+                PathBuf::from(name)
+            })
+            .find(|candidate| is_executable(candidate));
+    }
+    is_executable(path).then(|| path.to_path_buf())
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -148,11 +169,29 @@ mod tests {
 
     #[test]
     fn command_available_checks_path() {
-        assert!(command_available("sh"));
-        assert!(command_available("sh -c foo"));
-        assert!(command_available("/bin/sh"));
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(command_available(shell));
+        assert!(command_available(&format!("{shell} --some-flag")));
+        let exe = std::env::current_exe().unwrap();
+        assert!(command_available(&exe.display().to_string()));
         assert!(!command_available("kanso-no-such-binary-xyz"));
+        assert!(!command_available("./kanso-no-such-binary-xyz"));
         assert!(!command_available(""));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_names_resolve_through_pathext() {
+        let cmd = resolve_program("cmd").expect("cmd.exe is on PATH");
+        assert!(cmd
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe")));
+        let exe = std::env::current_exe().unwrap();
+        let bare = exe.with_extension("");
+        let resolved = resolve_program(&bare.display().to_string()).expect("test binary");
+        assert!(resolved
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&exe.to_string_lossy()));
     }
 
     #[test]

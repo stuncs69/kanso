@@ -109,8 +109,7 @@ pub fn project_root(start: &Path) -> PathBuf {
     } else {
         start.parent().map(Path::to_path_buf).unwrap_or_default()
     };
-    let base = base
-        .canonicalize()
+    let base = crate::util::canonicalize(&base)
         .or_else(|_| std::env::current_dir())
         .unwrap_or_else(|_| PathBuf::from("."));
     let mut dir = base.as_path();
@@ -388,7 +387,7 @@ mod tests {
         assert_eq!(finder.hit_path(&finder.hits[0]), "src/main.rs");
         assert_eq!(
             finder.selected_path(),
-            Some(dir.canonicalize().unwrap().join("src/main.rs"))
+            Some(crate::util::canonicalize(&dir).unwrap().join("src/main.rs"))
         );
         finder.move_selection(10);
         assert_eq!(finder.selected, 0);
@@ -402,6 +401,6 @@ mod tests {
     fn root_is_the_enclosing_git_repository() {
         let dir = temp_tree("root");
         let root = project_root(&dir.join("src/main.rs"));
-        assert_eq!(root, dir.canonicalize().unwrap());
+        assert_eq!(root, crate::util::canonicalize(&dir).unwrap());
     }
 }

@@ -375,10 +375,11 @@ impl App {
             }
             Ok(Reply::Diagnostics { uri, items }) => {
                 self.diagnostics_version += 1;
+                let key = lsp::uri_key(&uri);
                 if items.is_empty() {
-                    self.diagnostics.remove(&uri);
+                    self.diagnostics.remove(&key);
                 } else {
-                    self.diagnostics.insert(uri, items);
+                    self.diagnostics.insert(key, items);
                 }
             }
             Ok(Reply::Failed(message)) => {
@@ -394,7 +395,7 @@ impl App {
 
     fn publish_diagnostics(&mut self) {
         let uri = match self.active_language() {
-            Some((_, path)) if self.editor.settings.lsp => lsp::file_uri(&path),
+            Some((_, path)) if self.editor.settings.lsp => lsp::uri_key(&lsp::file_uri(&path)),
             _ => String::new(),
         };
         let stamp = (uri, self.diagnostics_version);

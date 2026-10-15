@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use serde_json::{json, Value};
@@ -94,7 +94,8 @@ pub fn spawn(
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty server command"))?;
     let debug_path = std::env::var("KANSO_DEBUG_LOG").ok();
-    let mut child = Command::new(program)
+    let executable = super::resolve_program(program).unwrap_or_else(|| PathBuf::from(program));
+    let mut child = Command::new(executable)
         .args(parts)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -506,12 +507,71 @@ fn parse_hover(result: &Value) -> Option<String> {
 }
 
 pub fn file_uri(path: &Path) -> String {
-    let absolute = if path.is_absolute() {
+    let text = absolute_path(path)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let mut uri = String::from(if text.starts_with("//") {
+        "file:"
+    } else if text.starts_with('/') {
+        "file://"
+    } else {
+        "file:///"
+    });
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            uri.push(byte as char);
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri
+}
+
+pub fn uri_key(uri: &str) -> String {
+    let bytes = uri.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                decoded.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
+    }
+    let decoded = String::from_utf8_lossy(&decoded).into_owned();
+    if cfg!(windows) {
+        decoded.to_lowercase()
+    } else {
+        decoded
+    }
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir().unwrap_or_default().join(path)
     };
-    format!("file://{}", absolute.display()).replace(' ', "%20")
+    let mut out = PathBuf::new();
+    for component in crate::util::strip_verbatim(joined).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 const ROOT_MARKERS: &[&str] = &[
@@ -524,11 +584,7 @@ const ROOT_MARKERS: &[&str] = &[
 ];
 
 pub(crate) fn project_root(file_path: &Path) -> PathBuf {
-    let absolute = if file_path.is_absolute() {
-        file_path.to_path_buf()
-    } else {
-        std::env::current_dir().unwrap_or_default().join(file_path)
-    };
+    let absolute = absolute_path(file_path);
     let start = absolute.parent().unwrap_or(&absolute);
     for dir in start.ancestors() {
         if ROOT_MARKERS.iter().any(|m| dir.join(m).exists()) {
@@ -580,19 +636,78 @@ mod tests {
         assert_eq!(project_root(&file), Path::new(env!("CARGO_MANIFEST_DIR")));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn file_uri_is_absolute() {
-        let uri = file_uri(Path::new("/tmp/a b.rs"));
-        assert_eq!(uri, "file:///tmp/a%20b.rs");
+    fn file_uri_is_absolute_and_encoded() {
+        assert_eq!(file_uri(Path::new("/tmp/a b.rs")), "file:///tmp/a%20b.rs");
+        assert_eq!(
+            file_uri(Path::new("/tmp/./x/../a#ü.rs")),
+            "file:///tmp/a%23%C3%BC.rs"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_uri_is_absolute_and_encoded() {
+        assert_eq!(
+            file_uri(Path::new(r"D:\tmp\a b.rs")),
+            "file:///D:/tmp/a%20b.rs"
+        );
+        assert_eq!(
+            file_uri(Path::new(r"\\?\D:\tmp\.\x\..\a#ü.rs")),
+            "file:///D:/tmp/a%23%C3%BC.rs"
+        );
+        assert_eq!(
+            file_uri(Path::new(r"\\server\share\a.rs")),
+            "file://server/share/a.rs"
+        );
+    }
+
+    #[test]
+    fn relative_paths_get_the_same_uri_as_absolute_ones() {
+        let absolute = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let cwd = std::env::current_dir().unwrap();
+        let relative = Path::new(".").join(absolute.strip_prefix(&cwd).unwrap());
+        assert_eq!(file_uri(&relative), file_uri(&absolute));
+    }
+
+    #[test]
+    fn uri_keys_ignore_encoding_differences() {
+        assert_eq!(
+            uri_key("file:///tmp/a%20b.rs"),
+            uri_key("file:///tmp/a b.rs")
+        );
+        assert_eq!(uri_key("file:///tmp/100%"), "file:///tmp/100%");
+        assert_ne!(uri_key("file:///tmp/a.rs"), uri_key("file:///tmp/b.rs"));
+        #[cfg(windows)]
+        assert_eq!(
+            uri_key("file:///d%3A/dev/x.rs"),
+            uri_key(&file_uri(Path::new(r"D:\dev\x.rs")))
+        );
+    }
+
+    fn python() -> Option<&'static str> {
+        ["python3", "python", "py"].into_iter().find(|candidate| {
+            Command::new(candidate)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
     }
 
     #[test]
     fn full_handshake_with_mock_server() {
+        let Some(python) = python() else {
+            eprintln!("skipping: no python interpreter for tests/mock_lsp.py");
+            return;
+        };
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mock_lsp.py");
         let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let (tx, rx) = mpsc::channel();
         let mut client = spawn(
-            &format!("python3 {}", script.display()),
+            &format!("{python} {}", script.display()),
             &file,
             "rust",
             move |msg| {

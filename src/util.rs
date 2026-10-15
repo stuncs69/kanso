@@ -1,3 +1,26 @@
+use std::io;
+use std::path::{Path, PathBuf};
+
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    path.canonicalize().map(strip_verbatim)
+}
+
+pub fn strip_verbatim(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        if let Some(text) = path.to_str() {
+            if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{rest}"));
+            }
+            if let Some(rest) = text.strip_prefix(r"\\?\") {
+                if rest.as_bytes().get(1) == Some(&b':') {
+                    return PathBuf::from(rest);
+                }
+            }
+        }
+    }
+    path
+}
+
 pub fn contract_home(text: &str) -> String {
     if let Some(dirs) = directories::BaseDirs::new() {
         let home = dirs.home_dir().display().to_string();
@@ -47,5 +70,29 @@ mod tests {
             .to_string();
         assert_eq!(contract_home(&format!("{home}/x")), "~/x");
         assert_eq!(contract_home("/usr/bin"), "/usr/bin");
+    }
+
+    #[test]
+    fn canonical_paths_have_no_verbatim_prefix() {
+        let dir = canonicalize(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert!(!dir.to_string_lossy().starts_with(r"\\?\"));
+        assert!(dir.join("Cargo.toml").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_prefixes_are_stripped() {
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\D:\dev")),
+            PathBuf::from(r"D:\dev")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\UNC\server\share\x")),
+            PathBuf::from(r"\\server\share\x")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from(r"\\?\Volume{abc}\x")),
+            PathBuf::from(r"\\?\Volume{abc}\x")
+        );
     }
 }

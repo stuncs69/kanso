@@ -15,7 +15,7 @@ pub struct Entry {
 
 impl Explorer {
     pub fn open(dir: &Path) -> io::Result<Explorer> {
-        let dir = dir.canonicalize()?;
+        let dir = crate::util::canonicalize(dir)?;
         let mut dirs = Vec::new();
         let mut files = Vec::new();
         for entry in std::fs::read_dir(&dir)? {

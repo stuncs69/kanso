@@ -1411,7 +1411,7 @@ impl Editor {
 }
 
 fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    crate::util::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn closing_bracket(open: char) -> char {
@@ -1932,7 +1932,10 @@ mod tests {
         let mut ed = Editor::new(Buffer::from_path(&a).unwrap(), Settings::default());
         ed.execute(Command::Explorer);
         let explorer = ed.explorer.as_ref().unwrap();
-        assert_eq!(explorer.dir, a.parent().unwrap().canonicalize().unwrap());
+        assert_eq!(
+            explorer.dir,
+            crate::util::canonicalize(a.parent().unwrap()).unwrap()
+        );
         assert_eq!(explorer.selected_entry().unwrap().name, "h.txt");
         ed.execute(Command::InsertChar('i'));
         assert_eq!(
